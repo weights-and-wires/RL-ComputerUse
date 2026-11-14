@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rl-computer-use"
+version = "0.1.0"
+description = "RL post-training of Qwen3-VL for browser tasks (BrowserGym MiniWoB++)."
+readme = "README.md"
+# vLLM 0.33.0 supports 3.11 to 3.14. The upper bound of 3.13 keeps you on a
+# version that every pin below has been checked against. The pod uses 3.12.
+requires-python = ">=3.11,<3.13"
+
+# Pin every package that touches the model stack, so a fresh pod resolves to
+# exactly what the plan was checked against. Do NOT pin torch here: vLLM pins
+# its own build (torch 2.14.0 for vllm 0.33.0), and a second pin makes the
+# resolver fail. Install with one `uv pip install` call so the resolver sees
+# every pin at once (scripts/pod_bootstrap.sh does this).
+dependencies = [
+  # Rollout engine. 0.33.0 is the release that TRL 1.18.0 accepts
+  # (vllm>=0.23,<0.34) and that supports LoRA on Qwen3-VL.
+  "vllm==0.33.0",
+  # vLLM 0.33.0 requires transformers>=5.16.1,<5.21.0. 5.20.2 is the newest
+  # release inside that range; 5.23.x is rejected by vLLM.
+  "transformers==5.20.2",
+  # GRPOTrainer with environment_factory (the TRL training path).
+  "trl==1.18.0",
+  # LoRA adapters. No upper bound on transformers, so it fits 5.20.x.
+  "peft==0.21.3",
+  # Satisfies TRL 1.18.0 (accelerate>=1.11.0).
+  "accelerate==1.15.0",
+  # Qwen's image resizing helpers. Pass image_patch_size=16 for Qwen3-VL.
+  "qwen-vl-utils==0.0.14",
+  # MiniWoB++ tasks wrapped as Gymnasium environments. The two BrowserGym
+  # packages must have identical versions.
+  "browsergym-miniwob==0.14.3",
+  "browsergym-core==0.14.3",
+  # browsergym-core pins playwright to exactly 1.44. Run
+  # `playwright install --with-deps chromium` after installing.
+  "playwright==1.44.0",
+  # Unpinned: nothing here is sensitive to the exact version. vLLM sets the
+  # floor for pillow (>=13) and numpy, so the resolver picks compatible builds.
+  "gymnasium",
+  "wandb",
+  "pyyaml",
+  "pillow",
+  "numpy",
+  "pandas",       # per-task CSV tables in cua.eval and cua.report
+  "imageio",      # GIF replays
+  "matplotlib",   # report charts
+  "tqdm",
+  "datasets",
+  "huggingface_hub",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+# Ship only the cua package, so `uv pip install -e .` exposes `python -m cua.*`.
+packages = ["cua"]
+
+[tool.uv]
+# torch comes from vLLM, and its CUDA build must match the pod's driver. Pass
+# `--torch-backend=auto` to `uv pip install` so uv reads the driver and picks
+# a matching wheel index. If the driver is older than R580, force
+# `--torch-backend=cu129` (or `cu128`). scripts/pod_bootstrap.sh does this for
+# you. `uv sync` doesn't take this flag, so use `uv pip install` on the pod.
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

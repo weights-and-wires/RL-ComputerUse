@@ -1,0 +1,31 @@
+# Rejection-sampling fine-tuning (warm start). See cua/rft.py.
+extends: base.yaml
+run_name: rft-4b
+
+rft:
+  tasks: selected
+  episodes_per_task: 32     # sampled at generation.temperature
+  max_kept_per_task: 64
+  require_no_format_errors: true
+  # Skip RFT entirely when the baseline is already good enough.
+  skip_if_format_error_rate_below: 0.05
+  skip_if_mean_success_above: 0.30
+
+sft:
+  output_dir: /workspace/ckpt/rft-4b
+  learning_rate: 1.0e-4
+  num_train_epochs: 1
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  max_length: 8192
+  gradient_checkpointing: true
+  logging_steps: 5
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  # Language-model projections only; the vision tower stays frozen.
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]

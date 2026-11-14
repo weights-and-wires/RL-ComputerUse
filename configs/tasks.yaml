@@ -1,0 +1,67 @@
+# Candidate task pool, held-out tasks, and seed ranges.
+#
+# Names are MiniWoB++ task names as registered by browsergym-miniwob; the env id
+# is "browsergym/miniwob.<name>". See the decisions log in docs/PLAN.md for
+# names that were checked against the installed version.
+
+train_candidates:
+  - click-button
+  - click-button-sequence
+  - click-checkboxes
+  - click-checkboxes-soft
+  - click-collapsible
+  - click-collapsible-2
+  - click-dialog
+  - click-dialog-2
+  - click-link
+  - click-option
+  - click-tab
+  - click-tab-2
+  - click-widget
+  - choose-list
+  - enter-date
+  - enter-password
+  - enter-text
+  - enter-text-dynamic
+  - focus-text-2
+  - login-user
+  - navigate-tree
+  - search-engine
+  - social-media
+  - use-autocomplete
+  - email-inbox
+  # Harder tasks, added after testing on 2026-11-15. The 4B base model solved
+  # most of the tasks above 80-100% of the time, which leaves GRPO nothing to
+  # learn from. These give the select phase more tasks in the 10-80% band.
+  - book-flight
+  - choose-date
+  - click-scroll-list
+  - click-menu
+  - click-shape
+  - count-shape
+  - enter-time
+  - find-word
+  - form-sequence-2
+  - grid-coordinate
+  - multi-orderings
+  - read-table
+  - simple-arithmetic
+  - social-media-some
+  - email-inbox-reply
+
+# Never used for selection, RFT, or GRPO. Only evaluated, to check that
+# training generalizes and doesn't break other skills.
+heldout_tasks:
+  - click-test-2
+  - enter-text-2
+  - login-user-popup
+  - click-checkboxes-large
+  - email-inbox-forward-nl
+
+# Seed ranges by purpose: [start, start + count). The loader refuses to run if
+# any two ranges overlap, so training can never see an evaluation seed.
+seeds:
+  eval:     {start: 0,    count: 100}      # greedy eval uses the first eval.num_seeds
+  baseline: {start: 100,  count: 100}      # sampled baseline for task selection
+  rft:      {start: 200,  count: 800}      # rejection-sampling warm start
+  train:    {start: 1000, count: 1000000}  # GRPO draws seeds from here

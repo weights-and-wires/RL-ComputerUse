@@ -1,0 +1,29 @@
+# Evaluation settings for cua.eval. The same file drives three modes:
+#   greedy   - headline number: temperature 0, one sample per seed
+#   sampled  - pass@k: k samples per seed at temperature 1.0
+#   baseline - task selection: num_seeds seeds x 1 sample at temperature 1.0
+extends: base.yaml
+run_name: eval
+
+eval:
+  mode: greedy           # greedy | sampled | baseline
+  tasks: selected        # candidates | selected | heldout | comma-separated names
+  seed_range: eval       # which range in tasks.yaml to draw seeds from
+  num_seeds: 50
+  k: 1                   # samples per seed; pass@k is computed for k >= 1
+  temperature: 0.0
+  gif_seeds: 3           # record GIFs for the first N seeds of every task
+  gif_fps: 2
+
+# Presets the scripts select with --set eval.mode=... plus these values.
+presets:
+  baseline: {tasks: candidates, seed_range: baseline, num_seeds: 16, k: 1, temperature: 1.0, gif_seeds: 0}
+  greedy:   {seed_range: eval, num_seeds: 50, k: 1, temperature: 0.0, gif_seeds: 3}
+  sampled:  {seed_range: eval, num_seeds: 20, k: 8, temperature: 1.0, gif_seeds: 0}
+  midtrain: {seed_range: eval, num_seeds: 10, k: 1, temperature: 0.0, gif_seeds: 0}
+
+select:
+  min_success: 0.10      # keep tasks the base model sometimes solves...
+  max_success: 0.80      # ...but hasn't mastered
+  min_tasks: 10          # if fewer qualify, widen toward the nearest tasks
+  max_tasks: 15

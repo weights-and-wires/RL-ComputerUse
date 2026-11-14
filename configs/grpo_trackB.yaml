@@ -1,0 +1,11 @@
+# Stretch goal: Track B (coordinate-only actions, screenshot only, no AXTree).
+extends: grpo_qwen3vl4b.yaml
+run_name: grpo-4b-trackB
+
+env:
+  track: B
+  max_turns: 10
+
+grpo:
+  output_dir: /workspace/ckpt/grpo-4b-trackB
+  max_steps: 100

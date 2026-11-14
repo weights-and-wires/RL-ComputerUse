@@ -1,0 +1,64 @@
+# Fallback GRPO run: Qwen3-VL-2B, Track A. Same code path as the 4B config,
+# roughly half the cost per rollout. Use it if 4B throughput is too low.
+# cua/nano_grpo/loop.py reads the same block, so both paths share settings.
+extends: base.yaml
+run_name: grpo-2b-trackA
+
+model:
+  name: Qwen/Qwen3-VL-2B-Instruct
+  # Start from the RFT adapter if the warm-start phase ran. saturday.sh sets
+  # this with --set model.adapter=... when /workspace/ckpt/rft-2b/final exists.
+  adapter: null
+
+tasks: selected          # training pool from select_tasks.py
+
+# Which GRPO implementation saturday.sh runs: "nano" (cua/nano_grpo, the
+# default because it steps browsers in parallel) or "trl" (cua/train_grpo.py).
+# See the decisions log in docs/PLAN.md for why.
+trainer: nano
+
+env:
+  pool_size: 32           # more browsers while training: 64 episodes per step
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+grpo:
+  output_dir: /workspace/ckpt/grpo-2b-trackA
+  learning_rate: 2.0e-5         # smaller model tolerates a bit more
+  lr_scheduler_type: constant_with_warmup
+  warmup_steps: 10
+  num_generations: 8          # G: episodes per (task, seed) group
+  prompts_per_step: 8         # task seeds per optimizer step -> 64 episodes
+  max_steps: 200
+  beta: 0.0                   # no KL penalty, no reference model
+  epsilon: 0.2                # lower clip
+  epsilon_high: 0.28          # upper clip ("clip-higher")
+  loss_type: dr_grpo
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  bf16: true
+  save_steps: 25
+  save_total_limit: 4
+  logging_steps: 1
+  eval_every: 50              # mid-training greedy eval (eval.yaml preset midtrain)
+  # Fraction of the GPU vLLM may take in colocate mode. Lower it on OOM.
+  vllm_gpu_memory_utilization: 0.30
+  seed: 0
+
+  # --- nano_grpo only ---
+  updates_per_step: 1         # optimizer steps per batch of 64 episodes. With 1, the
+                              # PPO ratio is 1 and clipping is inert (pure on-policy).
+                              # 2 splits the batch into two minibatches.
+  micro_batch_episodes: 2     # episodes per forward/backward pass (memory knob)
+
+  # --- TRL only (mapped onto GRPOConfig in cua/train_grpo.py) ---
+  per_device_train_batch_size: 8   # counts episodes, not prompts
+  gradient_accumulation_steps: 8   # 8 x 8 = 64 episodes per optimizer step
+  max_completion_length: 6144      # all turns: model text + tool text + image tokens
+  vllm_max_model_length: 8192
+  mask_truncated_completions: true
+  log_completions: true

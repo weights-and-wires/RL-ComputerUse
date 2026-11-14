@@ -1,0 +1,11 @@
+results/
+.runpod/
+.venv/
+__pycache__/
+*.egg-info
+wandb/
+.env
+.pytest_cache/
+.ruff_cache/
+results_test_run/
+.DS_Store

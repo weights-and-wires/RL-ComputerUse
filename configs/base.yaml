@@ -1,0 +1,72 @@
+# Shared defaults. Every other config starts with `extends: base.yaml` and
+# overrides only what differs. Override any value from the command line with
+# --set KEY=VALUE, for example --set env.pool_size=24.
+
+run_name: base
+
+paths:
+  # Relative paths resolve against the repository root. On the pod the
+  # repository lives on the network volume (/workspace/RL-ComputerUse), so
+  # results survive pod termination. CUA_RESULTS_DIR overrides results_dir.
+  results_dir: results
+  ckpt_dir: /workspace/ckpt
+  miniwob_html: /workspace/miniwob-plusplus/miniwob/html/miniwob/
+
+model:
+  name: Qwen/Qwen3-VL-4B-Instruct
+  # LoRA adapter to start from (for example the RFT adapter). null = base model.
+  adapter: null
+  dtype: bfloat16
+  # Bounds the number of image tokens per screenshot. Qwen3-VL uses 32x32-pixel
+  # tokens after merging, so 512x512 is roughly 256 tokens.
+  min_pixels: 65536     # 256 * 256
+  max_pixels: 409600    # 640 * 640 (a 512x320 MiniWoB screenshot is 160 tokens)
+
+env:
+  track: A              # A = element IDs + AXTree, B = coordinates, screenshot only
+  max_turns: 8
+  # MiniWoB screenshots are about 498x321 px (332x214 viewport at 1.5x zoom),
+  # so 512 means "keep native size". Lower it (for example 384) to save tokens.
+  screenshot_long_side: 512
+  max_axtree_chars: 2000
+  pool_size: 16         # concurrent browser worker processes (one Chromium each)
+  recycle_every: 50     # close and relaunch a browser after this many episodes
+  step_timeout_s: 60    # restart a worker process that takes longer than this
+  headless: true
+  record_frames: false  # keep full-size screenshots for GIF replays
+  # Put the first screenshot in the opening user message. TRL accepts an image
+  # list from reset() in code, but no TRL example does it yet; if the TRL path
+  # fails on it, set this to false (then the model sees its first screenshot
+  # after its first action). Every path reads this flag, so train and eval match.
+  first_obs_image: true
+  # BrowserGym timing knobs. MiniWoB defaults are slow_mo=100 ms per Playwright
+  # call and a 0.5 s sleep before each observation. Lowering them speeds up
+  # rollouts but can break tasks with animations (collapsibles, dialogs).
+  slow_mo_ms: 100
+  pre_observation_delay: 0.5
+
+generation:
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 160
+
+rewards:
+  format_penalty: 0.1       # subtracted per format error
+  format_penalty_cap: 0.3   # at most this much per episode
+  efficiency_coef: 0.1      # bonus = coef * (1 - turns_used / max_turns), success only
+
+vllm:
+  gpu_memory_utilization: 0.85   # standalone inference (eval, baseline, RFT sampling)
+  max_model_len: 16384   # long pages over several turns overflowed 8192 in testing
+  max_num_seqs: 64
+  enable_lora: true
+  max_lora_rank: 64    # vLLM accepts only 8, 16, 32, 64, 128, ...; must be >= lora.r
+  # Return log-probs after temperature scaling, which is what the policy
+  # actually sampled from. The default "raw_logprobs" is wrong for RL ratios.
+  logprobs_mode: processed_logprobs
+  seed: 0
+
+wandb:
+  project: rl-computer-use
+  entity: null      # null = your default W&B entity
+  mode: online      # set to "offline" if W&B is unreachable; sync later
