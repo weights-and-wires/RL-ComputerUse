@@ -166,7 +166,10 @@ def cmd_collect(cfg: Config) -> None:
     tasks = resolve_task_list(cfg.rft.tasks, cfg)
     # Seeds come from the dedicated "rft" range, which never overlaps eval or GRPO seeds.
     seeds = load_tasks().seed_range("rft").seeds(int(cfg.rft.episodes_per_task))
-    specs = rollout.make_group_specs(tasks, seeds, group_size=1)
+    # make_group_specs takes parallel (task, seed) lists, so pair every task
+    # with every seed: len(tasks) x len(seeds) episodes.
+    pairs = [(task, seed) for task in tasks for seed in seeds]
+    specs = rollout.make_group_specs([t for t, _ in pairs], [s for _, s in pairs], group_size=1)
     print(f"[rft] sampling {len(specs)} episodes ({len(tasks)} tasks x {len(seeds)} seeds)")
 
     adapter = cfg.model.get("adapter")
