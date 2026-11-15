@@ -11,6 +11,14 @@ no gradient. Tasks in the middle, where the model sometimes succeeds, teach the
 most. The thresholds live in `configs/eval.yaml` under `select:`.
 
 Output: `results/selected_tasks.json`, which `cua.config.load_selected_tasks` reads.
+
+Run 2 also uses this script to extend the held-out set:
+
+    python -m cua.select_tasks --heldout-extra 5 --baseline results/run2/eval/heldout-screen/per_task.csv
+
+That mode keeps the N screened tasks whose base-model rates are nearest 50%,
+where a change in either direction can show, and writes
+`results/heldout_v2.json` with the original held-out tasks plus those N.
 """
 
 from __future__ import annotations
@@ -21,7 +29,15 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from cua.config import add_config_args, config_from_args, load_tasks, results_dir, selected_tasks_path
+from cua.config import (
+    add_config_args,
+    config_from_args,
+    heldout_v2_path,
+    load_tasks,
+    resolve_task_list,
+    results_dir,
+    selected_tasks_path,
+)
 
 # Among tasks that qualify, prefer rates near this value when we must cap the
 # list. Near 0.5 the success and failure outcomes are balanced, which gives the
@@ -115,6 +131,19 @@ def select(
     }
 
 
+def pick_heldout_extra(rates: dict[str, tuple[int, float]], candidates: list[str], n: int) -> dict:
+    """Keeps the n candidates whose rates are nearest 0.5; ties break by name."""
+    present = [t for t in candidates if t in rates]
+    ranked = sorted(present, key=lambda t: (abs(rates[t][1] - 0.5), t))
+    picked = ranked[:n]
+    return {
+        "heldout_v2": load_tasks().heldout + picked,
+        "extra": picked,
+        "screen_rates": {t: rates[t][1] for t in present},
+        "missing": [t for t in candidates if t not in rates],
+    }
+
+
 def print_table(result: dict, rates: dict[str, tuple[int, float]]) -> None:
     print(f"{'task':28s} {'n':>4s} {'rate':>6s}  status")
     selected = set(result["selected"])
@@ -142,6 +171,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Path to the baseline per_task.csv. Default: results/eval/baseline/per_task.csv.",
     )
     parser.add_argument("--out", default=None, help="Output JSON path. Default: results/selected_tasks.json.")
+    parser.add_argument(
+        "--candidates",
+        default="candidates",
+        help='Task list to select from: a name such as "candidates" or "candidates_run2", or a comma-separated list.',
+    )
+    parser.add_argument(
+        "--heldout-extra",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Instead of selecting training tasks, keep the N held-out-v2 candidates nearest 50%% success "
+        "and write results/heldout_v2.json.",
+    )
     args = parser.parse_args(argv)
     cfg = config_from_args(args)
 
@@ -149,11 +191,23 @@ def main(argv: Optional[list[str]] = None) -> None:
     if not baseline.exists():
         raise SystemExit(f"{baseline} not found. Run the sampled baseline first (eval.mode=baseline).")
 
-    sel = cfg.select
     rates = read_rates(baseline)
+    if args.heldout_extra:
+        result = pick_heldout_extra(rates, load_tasks().heldout_v2_candidates, args.heldout_extra)
+        for task, rate in sorted(result["screen_rates"].items(), key=lambda kv: abs(kv[1] - 0.5)):
+            print(f"{task:28s} {rate:6.2f}  {'kept' if task in result['extra'] else 'not kept'}")
+        out = Path(args.out) if args.out else heldout_v2_path(cfg)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, indent=2))
+        print(f"Held-out v2: {result['heldout_v2']}\nWrote {out}")
+        if len(result["extra"]) < args.heldout_extra:
+            raise SystemExit(f"only {len(result['extra'])} screened tasks had results; wanted {args.heldout_extra}")
+        return
+
+    sel = cfg.select
     result = select(
         rates,
-        load_tasks().train_candidates,
+        resolve_task_list(args.candidates, cfg),
         float(sel.min_success),
         float(sel.max_success),
         int(sel.min_tasks),

@@ -5,6 +5,9 @@ the path that was tested end to end: one H100 PCIe pod in Runpod datacenter
 US-KS-2, about $2.89 per hour. The full run takes about 9 GPU hours, roughly
 $26.
 
+For run 2 (GRPO continued from the run-1 adapter), see the launch commands in
+[docs/PLAN_RUN2.md](docs/PLAN_RUN2.md) instead.
+
 Commands marked **Mac** run from the repository root on your Mac. Commands
 marked **Pod** run over SSH on the pod.
 

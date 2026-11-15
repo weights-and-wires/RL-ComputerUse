@@ -7,8 +7,10 @@ Run it with:
 One GRPO iteration (the numbers match the `# --- N.` section markers in
 `main`):
 
-1. Pick prompts. Choose `prompts_per_step` (task, seed) pairs, round-robin over
-   the selected tasks so every task gets equal attention.
+1. Pick prompts. Choose `prompts_per_step` (task, seed) pairs. The sampler is
+   round-robin (run 1: every task gets an equal share) or adaptive (run 2:
+   tasks whose groups are likely to have mixed outcomes get more rollouts). See
+   `sampler.py`.
 2. Roll out. For each prompt, sample G episodes with vLLM, stepping up to
    `env.pool_size` browsers in parallel. vLLM records the log-prob of each
    token it samples.
@@ -16,7 +18,10 @@ One GRPO iteration (the numbers match the `# --- N.` section markers in
    episode. Drop crashed episodes, then turn each group's rewards into
    advantages with `loss.group_advantages`.
 4. Filter. Skip groups where every reward is equal: their advantages are all 0,
-   so they would add 0 to the gradient and only cost compute.
+   so they would add 0 to the gradient and only cost compute. With dynamic
+   sampling on (DAPO), steps 1-4 repeat until enough mixed groups are found
+   or `max_rounds` rounds ran, because a rolled-out episode costs about a sixth
+   of a trained one.
 5. Train. Re-run the full conversation of each remaining episode through the
    PyTorch model, compute log-probs of the assistant tokens, and take
    `updates_per_step` optimizer steps on the clipped policy-gradient loss.
@@ -56,6 +61,7 @@ from cua.config import (
 )
 from cua.env import EnvPool
 from cua.nano_grpo import loss as L
+from cua.nano_grpo.sampler import make_sampler
 from cua.policy import VLLMPolicy, load_hf_model, tokenize_episode
 from cua.types import Episode, SamplingSpec
 
@@ -69,33 +75,18 @@ def chunks(items: list, n: int) -> list[list]:
 
 
 # ---------------------------------------------------------------------------
-# 1. Choosing prompts
-# ---------------------------------------------------------------------------
-
-
-def next_prompts(pos: int, n: int, tasks: list[str], seed_start: int) -> list[tuple[str, int]]:
-    """Returns n (task, seed) pairs starting at sampler position `pos`.
-
-    The k-th prompt is task `tasks[k % len(tasks)]` with seed index
-    `k // len(tasks)`. Tasks therefore rotate evenly and a (task, seed) pair is
-    never reused. `pos` is the only sampler state, so a checkpoint resumes
-    exactly where it stopped.
-    """
-    return [(tasks[k % len(tasks)], seed_start + k // len(tasks)) for k in range(pos, pos + n)]
-
-
-# ---------------------------------------------------------------------------
 # 3 and 4. Rewards, advantages, and filtering
 # ---------------------------------------------------------------------------
 
 
-def build_training_items(
+def build_training_groups(
     episodes: list[Episode], scale_rewards: bool
-) -> tuple[list[tuple[Episode, float]], list[list[float]], dict[str, float]]:
+) -> tuple[list[list[tuple[Episode, float]]], list[list[float]], dict[str, float]]:
     """Groups episodes, computes advantages, and drops groups with no signal.
 
-    Returns the (episode, advantage) pairs to train on, the rewards of every
-    surviving group (for `rewards.group_stats`), and counters for logging.
+    Returns one list of (episode, advantage) pairs per mixed group, the rewards
+    of every group with at least 2 live episodes (for `rewards.group_stats`),
+    and counters for logging.
     """
     groups: dict[tuple[str, int], list[Episode]] = {}
     num_crashed = 0
@@ -105,7 +96,7 @@ def build_training_items(
             continue
         groups.setdefault((ep.task, ep.seed), []).append(ep)
 
-    items: list[tuple[Episode, float]] = []
+    kept: list[list[tuple[Episode, float]]] = []
     rewards_by_group: list[list[float]] = []
     zero_variance = 0
     for group in groups.values():
@@ -119,13 +110,77 @@ def build_training_items(
             zero_variance += 1
             continue
         adv = L.group_advantages(r.unsqueeze(0), scale=scale_rewards)[0]
-        items.extend(zip(group, adv.tolist()))
+        kept.append(list(zip(group, adv.tolist())))
     counters = {
         "episodes/crashed": float(num_crashed),
-        "groups/used": float(len(rewards_by_group) - zero_variance),
-        "episodes/trained": float(len(items)),
+        "groups/used": float(len(kept)),
+        "episodes/trained": float(sum(len(g) for g in kept)),
     }
-    return items, rewards_by_group, counters
+    return kept, rewards_by_group, counters
+
+
+def build_training_items(
+    episodes: list[Episode], scale_rewards: bool
+) -> tuple[list[tuple[Episode, float]], list[list[float]], dict[str, float]]:
+    """`build_training_groups`, flattened into one list of (episode, advantage) pairs."""
+    kept, rewards_by_group, counters = build_training_groups(episodes, scale_rewards)
+    return [item for group in kept for item in group], rewards_by_group, counters
+
+
+def collect_groups(
+    sampler, roll, prompts_per_step: int, num_generations: int,
+    min_mixed: int, max_rounds: int, scale_rewards: bool,
+) -> tuple[list[Episode], list[list[tuple[Episode, float]]], list[list[float]], int, int]:
+    """Steps 1-4, repeated until `min_mixed` mixed groups or `max_rounds` rounds.
+
+    With `max_rounds=1` this is one plain GRPO rollout (run 1). With more, it is
+    DAPO's dynamic sampling: rolling out is cheap next to training, so keep
+    sampling until the step has enough groups that carry a gradient. The
+    sampler sees the outcome of every group, mixed or not.
+
+    Args:
+      sampler: A sampler from `sampler.py`.
+      roll: Runs a list of `EpisodeSpec` and returns their episodes.
+
+    Returns:
+      All episodes, the mixed groups as (episode, advantage) lists, the rewards
+      of every group, the number of crashed episodes, and the rounds used.
+    """
+    episodes: list[Episode] = []
+    mixed: list[list[tuple[Episode, float]]] = []
+    rewards_by_group: list[list[float]] = []
+    num_crashed = 0
+    rounds = 0
+    while rounds < max_rounds:
+        rounds += 1
+        specs = []
+        for task, seed in sampler.sample(prompts_per_step):  # 1. pick prompts
+            specs += rollout.make_group_specs([task], [seed], num_generations)
+        batch = roll(specs)  # 2. roll out
+        episodes += batch
+        kept, group_rewards, counters = build_training_groups(batch, scale_rewards)  # 3 and 4
+        mixed += kept
+        rewards_by_group += group_rewards
+        num_crashed += int(counters["episodes/crashed"])
+        for task, outcomes in group_outcomes(batch):
+            sampler.update(task, outcomes)
+        if len(mixed) >= min_mixed:
+            break
+    return episodes, mixed, rewards_by_group, num_crashed, rounds
+
+
+def group_outcomes(episodes: list[Episode]) -> list[tuple[str, list[bool]]]:
+    """Returns (task, successes) for each (task, seed) group, crashed episodes left out.
+
+    The adaptive sampler learns from every group, including the all-pass and
+    all-fail ones that the trainer skips: those are what tell it a task is
+    mastered or out of reach.
+    """
+    groups: dict[tuple[str, int], list[bool]] = {}
+    for ep in episodes:
+        if not ep.crashed:
+            groups.setdefault((ep.task, ep.seed), []).append(bool(ep.success))
+    return [(task, outcomes) for (task, _), outcomes in groups.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -202,17 +257,30 @@ def train_phase(
             token_cache[id(ep)] = tokenize_episode(processor, ep.messages, tools)
         return token_cache[id(ep)]
 
+    assistant_only = bool(g.get("assistant_only_logits", True))
+
     def forward(batch: list[tuple[Episode, float]]) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """One forward pass over whole conversations; returns log-probs and the loss mask."""
         b = collate([tok(ep) for ep, _ in batch], device)
+        # The mask is 1 only on assistant tokens: the model did not write the
+        # screenshots or page text, so training on them would be meaningless.
+        mask = b["assistant_mask"].float()
+        kwargs: dict[str, Any] = {}
+        if assistant_only:
+            # Only about 300 of an episode's ~5,000-10,000 tokens are the
+            # model's own. Ask for logits only at the positions that predict
+            # them, instead of a [batch, seq, 151,936] tensor (6 GB for two
+            # long episodes in bf16). See loss.logit_positions.
+            positions = L.logit_positions(mask)
+            kwargs["logits_to_keep"] = positions
         out = model(
             input_ids=b["input_ids"], attention_mask=b["attention_mask"],
             pixel_values=b.get("pixel_values"), image_grid_thw=b.get("image_grid_thw"),
-            mm_token_type_ids=b.get("mm_token_type_ids"), use_cache=False,
+            mm_token_type_ids=b.get("mm_token_type_ids"), use_cache=False, **kwargs,
         )
-        # The mask is 1 only on assistant tokens: the model did not write the
-        # screenshots or page text, so training on them would be meaningless.
-        return L.token_logprobs(out.logits, b["input_ids"]), b["assistant_mask"].float(), b
+        if assistant_only:
+            return L.token_logprobs_at(out.logits, b["input_ids"], positions), mask, b
+        return L.token_logprobs(out.logits, b["input_ids"]), mask, b
 
     # --- Old log-probs. With one update per batch the policy that samples and
     # the policy that trains are the same weights, so "old" equals "new" and we
@@ -421,6 +489,8 @@ def run_midtrain_eval(cfg: Config, tasks: list[str], step: int, policy: VLLMPoli
         for key, value in ecfg.presets["midtrain"].items():  # apply the preset ourselves; it is idempotent
             ecfg.eval[key] = value
         ecfg.eval["tasks"] = list(tasks)
+        if cfg.grpo.get("eval_num_seeds"):  # run 2: more seeds than the preset's 10
+            ecfg.eval["num_seeds"] = int(cfg.grpo.eval_num_seeds)
         summary = evaluate(ecfg, policy=policy, pool=pool, log_wandb=False)
         for key in ("success", "overall_success", "success_rate"):
             value = summary.get(key)
@@ -437,6 +507,30 @@ def run_midtrain_eval(cfg: Config, tasks: list[str], step: int, policy: VLLMPoli
 # ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
+
+
+def build_sampler(cfg: Config, tasks: list[str], seed_start: int):
+    """Creates the prompt sampler named by `grpo.sampler` (default: round_robin).
+
+    The adaptive sampler starts from the sampled-baseline rates that
+    `select_tasks.py` stored in `selected_tasks.json`, when they exist.
+    """
+    g = cfg.grpo
+    kind = str(g.get("sampler", "round_robin"))
+    if kind != "adaptive":
+        return make_sampler(kind, tasks, seed_start, int(g.num_generations))
+    opts = g.get("adaptive") or {}
+    init_rates: dict[str, float] = {}
+    sel = results_dir(cfg) / "selected_tasks.json"
+    if sel.exists():
+        init_rates = {t: float(r) for t, r in json.loads(sel.read_text()).get("rates", {}).items()}
+    return make_sampler(
+        kind, tasks, seed_start, int(g.num_generations),
+        init_rates=init_rates,
+        ema_alpha=float(opts.get("ema_alpha", 0.2)),
+        floor=float(opts.get("floor", 0.05)),
+        rng=random.Random(int(g.seed)),
+    )
 
 
 def init_wandb(cfg: Config, run_id: str | None):
@@ -461,7 +555,8 @@ def main(argv: list[str] | None = None) -> None:
     g = cfg.grpo
 
     tasks = resolve_task_list(cfg.tasks, cfg)
-    seed_start = load_tasks().seed_range("train").start
+    # Run 2 offsets its seeds so it never replays a (task, seed) pair from run 1.
+    seed_start = load_tasks().seed_range("train").start + int(g.get("train_seed_offset", 0))
     out_dir = Path(g.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     track = cfg.env.track
@@ -489,11 +584,25 @@ def main(argv: list[str] | None = None) -> None:
     )
     scheduler = get_constant_schedule_with_warmup(optimizer, g.warmup_steps)
 
-    state = {"step": 0, "sampler_pos": 0, "micro_batch_episodes": int(g.micro_batch_episodes), "wandb_run_id": None}
+    sampler = build_sampler(cfg, tasks, seed_start)
+    dyn = g.get("dynamic_sampling") or {}
+    dyn_on = bool(dyn.get("enabled", False))
+    min_mixed = int(dyn.get("min_mixed_groups", 6))
+    max_rounds = int(dyn.get("max_rounds", 3)) if dyn_on else 1
+    max_train_groups = int(dyn.get("max_train_groups", 0)) or None  # None: no cap
+
+    state = {"step": 0, "micro_batch_episodes": int(g.micro_batch_episodes), "wandb_run_id": None}
     if resume_from:
         state = load_training_state(resume_from, optimizer, scheduler)
+        if "sampler" in state:
+            sampler.load_state_dict(state["sampler"])
+        elif "sampler_pos" in state:  # a checkpoint from before sampler.py existed
+            sampler.load_state_dict({"pos": state["sampler_pos"]})
         log(f"resumed from {resume_from} at step {state['step']}")
     micro_bs = int(state["micro_batch_episodes"])
+    log(f"sampler={g.get('sampler', 'round_robin')} dynamic_sampling={dyn_on} "
+        f"(min_mixed_groups={min_mixed}, max_rounds={max_rounds}, max_train_groups={max_train_groups}) "
+        f"tasks={tasks}")
 
     run = init_wandb(cfg, state.get("wandb_run_id"))
     state["wandb_run_id"] = run.id if run else None
@@ -508,35 +617,48 @@ def main(argv: list[str] | None = None) -> None:
     checkpoint_args = (model, processor, optimizer, scheduler, out_dir)
 
     def checkpoint() -> None:
-        state.update(step=step, micro_batch_episodes=micro_bs)
+        state.update(step=step, micro_batch_episodes=micro_bs, sampler=sampler.state_dict())
+        state.pop("sampler_pos", None)
         save_checkpoint(*checkpoint_args, state, int(g.save_total_limit))
 
     with EnvPool(cfg) as pool:
         step_done = True
+        sampler_snapshot = sampler.state_dict()
         try:
             while step < g.max_steps:
                 step += 1
                 step_done = False  # lets the Ctrl-C handler undo a half-finished step
+                sampler_snapshot = sampler.state_dict()
                 torch.cuda.reset_peak_memory_stats()
                 t0 = time.perf_counter()
 
-                # --- 1. Pick prompts and build G episode specs for each.
-                prompts = next_prompts(state["sampler_pos"], g.prompts_per_step, tasks, seed_start)
-                state["sampler_pos"] += g.prompts_per_step
-                specs = []
-                for task, seed in prompts:
-                    specs += rollout.make_group_specs([task], [seed], g.num_generations)
+                # --- 1 to 4, repeated while dynamic sampling wants more mixed groups.
+                def roll(specs: list) -> list[Episode]:  # 2. vLLM, all browsers in parallel
+                    return rollout.run_episodes(specs, policy.generate, pool, cfg, sampling, track=track, progress=False)
 
-                # --- 2. Roll out with vLLM (all browsers in parallel).
-                episodes = rollout.run_episodes(
-                    specs, policy.generate, pool, cfg, sampling, track=track, progress=False
+                episodes, mixed, rewards_by_group, num_crashed, rounds = collect_groups(
+                    sampler, roll, int(g.prompts_per_step), int(g.num_generations),
+                    min_mixed=min_mixed, max_rounds=max_rounds,
+                    scale_rewards=bool(g.get("scale_rewards", True)),
                 )
                 t_rollout = time.perf_counter() - t0
 
-                # --- 3 and 4. Advantages, and skipping groups with no signal.
-                items, rewards_by_group, counters = build_training_items(
-                    episodes, scale_rewards=bool(g.get("scale_rewards", True))
-                )
+                # Cap the groups we train on: training costs about 6x rollouts per episode.
+                num_mixed = len(mixed)
+                if max_train_groups is not None and len(mixed) > max_train_groups:
+                    random.shuffle(mixed)
+                    mixed = mixed[:max_train_groups]
+                items = [item for group in mixed for item in group]
+                counters = {
+                    "episodes/crashed": float(num_crashed),
+                    "groups/used": float(len(mixed)),
+                    "episodes/trained": float(len(items)),
+                    "dyn/rounds": float(rounds),
+                    "dyn/mixed_groups": float(num_mixed),
+                    "dyn/groups_rolled": float(rounds * int(g.prompts_per_step)),
+                    **{f"task_rate/{t}": r for t, r in sampler.rates().items()},
+                    **{f"task_weight/{t}": w for t, w in sampler.weights().items()},
+                }
                 alive = [ep for ep in episodes if not ep.crashed]
 
                 # --- 5. Train.
@@ -608,7 +730,7 @@ def main(argv: list[str] | None = None) -> None:
             if not step_done:
                 # The interrupted step changed no saved state; replay it on resume.
                 step -= 1
-                state["sampler_pos"] -= g.prompts_per_step
+                sampler.load_state_dict(sampler_snapshot)
             checkpoint()
             sys.exit(130)
 

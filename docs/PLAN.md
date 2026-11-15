@@ -492,3 +492,13 @@ The implementation adds these files to the repository layout:
   `nano_grpo` turns into a final checkpoint.
 - `RemoteEnv` starts its worker processes without re-importing the trainer's
   `__main__` module, so 32 browser workers don't each load PyTorch.
+
+### Run 2
+
+Run 2 continues GRPO from the run-1 adapter. Its plan, results criteria, and
+launch commands are in [PLAN_RUN2.md](PLAN_RUN2.md). The code changes keep
+run 1 reproducible: `configs/grpo_qwen3vl4b.yaml` still uses the round-robin
+sampler with dynamic sampling off. One change applies to both runs: the
+trainer computes logits only at assistant-token positions
+(`grpo.assistant_only_logits`, default on), which gives the same loss with far
+less memory.
