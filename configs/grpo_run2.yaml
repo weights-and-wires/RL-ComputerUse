@@ -38,7 +38,10 @@ grpo:
     enabled: true
     min_mixed_groups: 6     # stop rolling out once this many groups have mixed rewards
     max_rounds: 3           # never more than this many rounds per step
-    max_train_groups: 8     # train on at most this many groups (bounds train time)
+    # Train on at most this many groups (bounds train time). The plan said 8,
+    # with a fallback to 6 if training ran above 5 s per episode. The pod's
+    # smoke test measured 5.2 s (56 episodes in 294 s), so 6.
+    max_train_groups: 6
 
   # Compute logits only at assistant-token positions (same math, less memory).
   assistant_only_logits: true
