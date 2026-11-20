@@ -1,4 +1,4 @@
-# RL-ComputerUse
+# Qwen3-VL (4B) Computer Use (RL, GRPO)
 
 A one-day learning project: RL post-training of `Qwen/Qwen3-VL-4B-Instruct` with
 GRPO to make it better at browser tasks in MiniWoB++, trained on one Runpod H100.
