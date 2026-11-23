@@ -41,6 +41,37 @@ POOL_TITLES = {"train": "Training pool", "heldout": "Held-out pool"}
 LABELS = {"base": "Base", "rft": "RFT", "grpo": "GRPO"}
 # Colors for the bars. They stay readable on the white chart background.
 COLORS = {"base": "#8a8f98", "rft": "#e69f00", "grpo": "#0072b2"}
+# Deltas on the headline cards are measured against this slot, and the GIF
+# grid pairs these two slots.
+DELTA_REF = "base"
+GIF_PAIR = ("base", "grpo")
+SUBTITLE = "MiniWoB++ via BrowserGym. Base vs rejection-sampling fine-tuning (RFT) vs GRPO."
+
+# Run 2 (docs/PLAN_RUN2.md) reuses the three slots: base model, run-1 adapter,
+# run-2 adapter. Its eval folders live under results/run2/eval/.
+PRESETS: dict[str, dict[str, Any]] = {
+    "run2": {
+        "POOLS": {
+            "train": {"base": "base-pool2", "rft": "run1-pool2", "grpo": "run2-pool2"},
+            "heldout": {"base": "base-heldout2", "rft": "run1-heldout2", "grpo": "run2-heldout2"},
+        },
+        "POOL_TITLES": {"train": "Run-2 training pool", "heldout": "Held-out v2 pool"},
+        "LABELS": {"base": "Base", "rft": "Run 1", "grpo": "Run 2"},
+        "GOAL_POINTS": 10.0,
+        "DELTA_REF": "rft",
+        "GIF_PAIR": ("rft", "grpo"),
+        "SUBTITLE": "Run 2: GRPO continued from the run-1 adapter. Base vs run 1 vs run 2, paired on the same seeds.",
+    },
+}
+
+
+def apply_preset(name: Optional[str]) -> None:
+    """Switches the module-level run names and labels to a preset (None keeps run 1's)."""
+    if not name:
+        return
+    if name not in PRESETS:
+        raise SystemExit(f"Unknown preset {name!r}. Choose from: {', '.join(PRESETS)}")
+    globals().update(PRESETS[name])
 FAILURE_MODES = ["success", "wrong_action", "invalid_action", "format_error", "ran_out_of_turns", "crashed"]
 FAILURE_LABELS = {
     "success": "Success",
@@ -139,8 +170,8 @@ def headline_section(summaries: dict[str, Optional[dict]]) -> str:
     """Cards with success rates and deltas against the base model."""
     parts = []
     for pool, runs in POOLS.items():
-        base = summaries.get(runs["base"])
-        base_rate = base.get("overall_success") if base else None
+        ref = summaries.get(runs[DELTA_REF])
+        base_rate = ref.get("overall_success") if ref else None
         cards = []
         for key in ("base", "rft", "grpo"):
             s = summaries.get(runs[key])
@@ -152,10 +183,10 @@ def headline_section(summaries: dict[str, Optional[dict]]) -> str:
                 )
                 continue
             delta_html = ""
-            if key != "base" and base_rate is not None:
+            if key != DELTA_REF and key != "base" and base_rate is not None:
                 delta = 100 * (rate - base_rate)
                 cls = "good" if delta > 0 else ("bad" if delta < 0 else "muted")
-                delta_html = f'<div class="delta {cls}">{delta:+.1f} points vs base</div>'
+                delta_html = f'<div class="delta {cls}">{delta:+.1f} points vs {esc(LABELS[DELTA_REF])}</div>'
                 if pool == "train":
                     verdict = "goal met" if delta >= GOAL_POINTS else f"below the +{GOAL_POINTS:.0f} goal"
                     delta_html += f'<div class="small">{verdict}</div>'
@@ -169,7 +200,7 @@ def headline_section(summaries: dict[str, Optional[dict]]) -> str:
         parts.append(f"<h3>{POOL_TITLES[pool]}</h3><div class=\"cards\">{''.join(cards)}</div>")
     note = (
         f"<p class=\"small muted\">Greedy decoding on held-out seeds. Goal: at least +{GOAL_POINTS:.0f} points "
-        "on the training pool, and no drop on the held-out pool.</p>"
+        f"over {esc(LABELS[DELTA_REF])} on the training pool, and no drop on the held-out pool.</p>"
     )
     return "<h2>Headline numbers</h2>" + note + "".join(parts)
 
@@ -311,11 +342,11 @@ def curves_section(metrics: dict[str, list[dict]], eval_dir: Path) -> str:
 
 
 def gif_pairs_section(eval_dir: Path, out_dir: Path, max_pairs: int = 24) -> str:
-    """Grid of base-vs-GRPO GIFs on identical task and seed."""
-    parts = ["<h2>Replays: base vs GRPO</h2>"]
+    """Grid of GIF pairs (the two GIF_PAIR runs) on identical task and seed."""
+    parts = [f"<h2>Replays: {esc(LABELS[GIF_PAIR[0]])} vs {esc(LABELS[GIF_PAIR[1]])}</h2>"]
     pairs: list[tuple[int, str, str, str, Optional[bool], Optional[bool]]] = []
     for pool in POOLS:
-        base_run, grpo_run = POOLS[pool]["base"], POOLS[pool]["grpo"]
+        base_run, grpo_run = POOLS[pool][GIF_PAIR[0]], POOLS[pool][GIF_PAIR[1]]
         base_dir, grpo_dir = eval_dir / base_run / "gifs", eval_dir / grpo_run / "gifs"
         if not (base_dir.is_dir() and grpo_dir.is_dir()):
             continue
@@ -333,13 +364,13 @@ def gif_pairs_section(eval_dir: Path, out_dir: Path, max_pairs: int = 24) -> str
             priority = 0 if (b is False and g is True) else (1 if b != g else 2)
             pairs.append((priority, pool, gif.name, key[0] if key else gif.stem, b, g))
     if not pairs:
-        return "".join(parts) + not_run("need GIFs from both base-* and grpo-* eval runs on the same seeds")
+        return "".join(parts) + not_run("need GIFs from both compared eval runs on the same seeds")
 
     pairs.sort(key=lambda p: (p[0], p[1], p[2]))
     cells = []
     for _, pool, name, task, b, g in pairs[:max_pairs]:
         sources = {}
-        for label, run in (("base", POOLS[pool]["base"]), ("grpo", POOLS[pool]["grpo"])):
+        for label, run in (("base", POOLS[pool][GIF_PAIR[0]]), ("grpo", POOLS[pool][GIF_PAIR[1]])):
             dest = out_dir / "gifs" / run / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(eval_dir / run / "gifs" / name, dest)
@@ -351,8 +382,8 @@ def gif_pairs_section(eval_dir: Path, out_dir: Path, max_pairs: int = 24) -> str
         cells.append(
             f'<figure class="pair"><figcaption><b>{esc(name[:-4])}</b> <span class="small muted">({esc(POOL_TITLES[pool])})</span></figcaption>'
             f'<div class="pairgrid">'
-            f'<div><img loading="lazy" src="{esc(sources["base"])}" alt="Base replay of {esc(name)}"><div class="small">Base: {badge(b)}</div></div>'
-            f'<div><img loading="lazy" src="{esc(sources["grpo"])}" alt="GRPO replay of {esc(name)}"><div class="small">GRPO: {badge(g)}</div></div>'
+            f'<div><img loading="lazy" src="{esc(sources["base"])}" alt="{esc(LABELS[GIF_PAIR[0]])} replay of {esc(name)}"><div class="small">{esc(LABELS[GIF_PAIR[0]])}: {badge(b)}</div></div>'
+            f'<div><img loading="lazy" src="{esc(sources["grpo"])}" alt="{esc(LABELS[GIF_PAIR[1]])} replay of {esc(name)}"><div class="small">{esc(LABELS[GIF_PAIR[1]])}: {badge(g)}</div></div>'
             f"</div></figure>"
         )
     parts.append(f'<div class="pairs">{"".join(cells)}</div>')
@@ -437,7 +468,7 @@ def build_report(cfg: Any, out_dir: Optional[Path] = None) -> Path:
         "<title>RL for computer use: report</title>"
         f"<style>{CSS}</style></head><body><main>"
         "<h1>RL post-training Qwen3-VL for browser tasks</h1>"
-        '<p class="muted">MiniWoB++ via BrowserGym. Base vs rejection-sampling fine-tuning (RFT) vs GRPO.</p>'
+        f'<p class="muted">{esc(SUBTITLE)}</p>'
         + "".join(body)
         + "</main></body></html>"
     )
@@ -450,7 +481,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Build results/report/index.html from eval and training outputs.")
     add_config_args(parser, "configs/eval.yaml")
     parser.add_argument("--out", default=None, help="Output directory. Default: results/report.")
+    parser.add_argument("--preset", default=None, help='Run names and labels to use: omit for run 1, or "run2".')
     args = parser.parse_args(argv)
+    apply_preset(args.preset)
     cfg = config_from_args(args)
     path = build_report(cfg, Path(args.out) if args.out else None)
     print(f"Wrote {path}")

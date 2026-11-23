@@ -179,6 +179,62 @@ def token_logprobs(logits: torch.Tensor, input_ids: torch.Tensor, chunk_size: in
     return F.pad(logp, (1, 0))  # prepend the dummy value for position 0
 
 
+def logit_positions(mask: torch.Tensor) -> torch.Tensor:
+    """Returns the positions whose logits predict a masked (assistant) token.
+
+    The logits at position t predict the token at t + 1, so a token at position
+    t needs the logits at t - 1. The result covers the union over the batch,
+    which is what `logits_to_keep` (a 1D index tensor, the same for every
+    sample) accepts. For one episode per micro-batch it is exact; for more it
+    adds a few positions that the mask zeroes out later.
+
+    Args:
+      mask: `[B, T]`, 1 on assistant tokens.
+
+    Returns:
+      Sorted 1D long tensor of positions in `[0, T - 2]`, on the mask's device.
+    """
+    tokens = torch.nonzero(mask.bool().any(dim=0), as_tuple=False).flatten()
+    tokens = tokens[tokens >= 1]  # position 0 has no prefix and is never an assistant token
+    return tokens - 1
+
+
+def token_logprobs_at(
+    logits: torch.Tensor, input_ids: torch.Tensor, positions: torch.Tensor, chunk_size: int = 1024
+) -> torch.Tensor:
+    """`token_logprobs`, from logits computed only at `positions`.
+
+    Use this with a model called as `model(..., logits_to_keep=positions)`,
+    which applies the vocabulary projection only at those positions. The
+    returned tensor has the same `[B, T]` layout as `token_logprobs`, with the
+    log-prob of `input_ids[:, p + 1]` at index `p + 1` and 0 everywhere else,
+    so the masks and slicing downstream stay unchanged.
+
+    Args:
+      logits: `[B, K, V]`, where `K = len(positions)`.
+      input_ids: `[B, T]`.
+      positions: 1D long tensor from `logit_positions`.
+      chunk_size: Positions per chunk, as in `token_logprobs`.
+
+    Returns:
+      Float32 tensor of shape `[B, T]`.
+    """
+    targets = input_ids[:, positions + 1]
+    use_ckpt = torch.is_grad_enabled() and logits.requires_grad
+    pieces = []
+    for start in range(0, logits.shape[1], chunk_size):
+        chunk_logits = logits[:, start : start + chunk_size]
+        chunk_ids = targets[:, start : start + chunk_size]
+        if use_ckpt:
+            pieces.append(checkpoint(_gather_logp, chunk_logits, chunk_ids, use_reentrant=False))
+        else:
+            pieces.append(_gather_logp(chunk_logits, chunk_ids))
+    logp = torch.cat(pieces, dim=1) if pieces else logits.new_zeros(input_ids.shape[0], 0, dtype=torch.float32)
+    out = torch.zeros(input_ids.shape, dtype=torch.float32, device=logits.device)
+    out[:, positions + 1] = logp  # index assignment keeps the autograd graph
+    return out
+
+
 def microbatch_weight(
     loss_type: str, micro_tokens: float, total_tokens: float, micro_seqs: int, total_seqs: int
 ) -> float:

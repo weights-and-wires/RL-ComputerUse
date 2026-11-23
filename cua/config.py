@@ -25,7 +25,7 @@ import argparse
 import copy
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -144,6 +144,13 @@ class TaskSpec:
     train_candidates: list[str]
     heldout: list[str]
     seed_ranges: dict[str, SeedRange]
+    train_candidates_run2_extra: list[str] = field(default_factory=list)
+    run1_pool: list[str] = field(default_factory=list)
+    heldout_v2_candidates: list[str] = field(default_factory=list)
+
+    @property
+    def train_candidates_run2(self) -> list[str]:
+        return self.train_candidates + [t for t in self.train_candidates_run2_extra if t not in self.train_candidates]
 
     def seed_range(self, name: str) -> SeedRange:
         """Seed range by purpose: 'eval', 'baseline', 'rft', or 'train'."""
@@ -154,11 +161,24 @@ def load_tasks(path: str | os.PathLike = CONFIG_DIR / "tasks.yaml") -> TaskSpec:
     data = _load_yaml_with_extends(Path(path).resolve())
     ranges = {k: SeedRange(**v) for k, v in data["seeds"].items()}
     _check_seed_ranges_disjoint(ranges)
-    return TaskSpec(
+    spec = TaskSpec(
         train_candidates=list(data["train_candidates"]),
         heldout=list(data["heldout_tasks"]),
         seed_ranges=ranges,
+        train_candidates_run2_extra=list(data.get("train_candidates_run2_extra") or []),
+        run1_pool=list(data.get("run1_pool") or []),
+        heldout_v2_candidates=list(data.get("heldout_v2_candidates") or []),
     )
+    _check_heldout_disjoint(spec)
+    return spec
+
+
+def _check_heldout_disjoint(spec: TaskSpec) -> None:
+    """Fail fast if a held-out task could ever be trained on."""
+    train = set(spec.train_candidates_run2)
+    leaked = train & (set(spec.heldout) | set(spec.heldout_v2_candidates))
+    if leaked:
+        raise ValueError(f"held-out tasks also listed as training candidates: {sorted(leaked)}; fix configs/tasks.yaml")
 
 
 def _check_seed_ranges_disjoint(ranges: dict[str, SeedRange]) -> None:
@@ -191,21 +211,41 @@ def load_selected_tasks(cfg: Optional[Config] = None) -> list[str]:
     return list(json.loads(path.read_text())["selected"])
 
 
+def heldout_v2_path(cfg: Optional[Config] = None) -> Path:
+    return results_dir(cfg) / "heldout_v2.json"
+
+
 def resolve_task_list(names: list[str] | str, cfg: Optional[Config] = None) -> list[str]:
     """Expand the symbolic task-list names used in configs and CLIs.
 
     - "candidates": all training candidates from tasks.yaml
+    - "candidates_run2": the candidates plus run 2's extra tasks
     - "selected": the pool picked by select_tasks.py
     - "heldout": the held-out generalization tasks
+    - "heldout_v2_candidates": tasks screened for the run-2 held-out extension
+    - "heldout_v2": the held-out tasks plus the screened extension
+      (results/heldout_v2.json, written by select_tasks.py --heldout-extra)
+    - "run1_pool": run 1's training pool
     - anything else: a literal comma-separated list or a YAML list of names
     """
     spec = load_tasks()
     if isinstance(names, str):
         if names == "candidates":
             return spec.train_candidates
+        if names == "candidates_run2":
+            return spec.train_candidates_run2
         if names == "selected":
             return load_selected_tasks(cfg)
         if names == "heldout":
             return spec.heldout
+        if names == "heldout_v2_candidates":
+            return spec.heldout_v2_candidates
+        if names == "run1_pool":
+            return spec.run1_pool
+        if names == "heldout_v2":
+            path = heldout_v2_path(cfg)
+            if not path.exists():
+                raise FileNotFoundError(f"{path} not found. Run `python -m cua.select_tasks --heldout-extra 5` first.")
+            return list(json.loads(path.read_text())["heldout_v2"])
         return [n.strip() for n in names.split(",") if n.strip()]
     return list(names)

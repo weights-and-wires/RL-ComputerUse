@@ -1,0 +1,47 @@
+# Run 2: continue GRPO from the run-1 adapter. See docs/PLAN_RUN2.md.
+#
+# Differences from run 1 (grpo_qwen3vl4b.yaml):
+#   - adaptive task sampler instead of round-robin
+#   - dynamic sampling: roll out up to 3 rounds until 6 groups have mixed outcomes
+#   - 2 optimizer updates per step, so the PPO clip is active
+#   - mid-training evals every 25 steps with 20 seeds per task
+#
+# scripts/run2.sh sets model.adapter to the run-1 adapter and runs with
+# CUA_RESULTS_DIR=results/run2, so `tasks: selected` reads the run-2 pool.
+extends: grpo_qwen3vl4b.yaml
+run_name: grpo-4b-run2
+
+model:
+  adapter: null             # set with --set model.adapter=/root/run1
+
+grpo:
+  output_dir: /workspace/ckpt/grpo-4b-run2
+  max_steps: 300            # the time cap (GRPO_MAX_HOURS) ends the run first
+  learning_rate: 1.0e-5     # fresh AdamW on the run-1 weights
+  warmup_steps: 10
+  save_steps: 25
+  eval_every: 25
+  eval_num_seeds: 20        # mid-training eval: 20 seeds per pool task, not 10
+  updates_per_step: 2       # two minibatches per step; the second sees ratio != 1
+
+  # Run 1 used train seeds 1000-1127 per task; start well past them.
+  train_seed_offset: 100000
+
+  # Prompt sampler: round_robin (run 1) or adaptive (run 2, see cua/nano_grpo/sampler.py).
+  sampler: adaptive
+  adaptive:
+    ema_alpha: 0.2          # weight of the newest group in each task's success estimate
+    floor: 0.05             # smallest task weight, so mastered tasks still get replayed
+
+  # DAPO dynamic sampling. Each round rolls out prompts_per_step groups.
+  dynamic_sampling:
+    enabled: true
+    min_mixed_groups: 6     # stop rolling out once this many groups have mixed rewards
+    max_rounds: 3           # never more than this many rounds per step
+    # Train on at most this many groups (bounds train time). The plan said 8,
+    # with a fallback to 6 if training ran above 5 s per episode. The pod's
+    # smoke test measured 5.2 s (56 episodes in 294 s), so 6.
+    max_train_groups: 6
+
+  # Compute logits only at assistant-token positions (same math, less memory).
+  assistant_only_logits: true

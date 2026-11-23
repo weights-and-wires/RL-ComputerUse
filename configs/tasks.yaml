@@ -49,6 +49,63 @@ train_candidates:
   - social-media-some
   - email-inbox-reply
 
+# Run 2 adds these to the candidates (task list "candidates_run2"). They are
+# tasks Track A can do: no drag, draw, or slider tasks, and no tasks that need
+# exact coordinates. Tasks close to a held-out task are left out on purpose
+# (email-inbox-forward*, email-inbox-nl-turk, login-user-popup, click-test*,
+# enter-text-2). See docs/PLAN_RUN2.md.
+train_candidates_run2_extra:
+  - click-menu-2
+  - click-pie
+  - click-shades
+  - click-color
+  - click-tab-2-hard
+  - copy-paste
+  - copy-paste-2
+  - email-inbox-important
+  - email-inbox-star-reply
+  - social-media-all
+  - number-checkboxes
+  - buy-ticket
+  - phone-book
+  - stock-market
+  - find-greatest
+  - identify-shape
+  - text-transform
+  - guess-number
+  - multi-layouts
+  - use-spinner
+  - scroll-text-2
+  - odd-or-even
+
+# Run 1's training pool (results/selected_tasks.json from run 1), kept here so
+# run 2 can check retention on it without run 1's results folder.
+run1_pool:
+  - click-collapsible-2
+  - choose-date
+  - click-scroll-list
+  - click-menu
+  - enter-time
+  - find-word
+  - click-widget
+  - enter-date
+  - social-media
+  - email-inbox
+
+# Candidates for the run-2 held-out extension. select_tasks.py --heldout-extra
+# screens them with the base model and keeps the 5 nearest 50% success; the
+# result (the 5 tasks below plus the chosen ones) is the "heldout_v2" list.
+# The config loader refuses any overlap with the training candidates.
+heldout_v2_candidates:
+  - click-checkboxes-transfer
+  - email-inbox-delete
+  - form-sequence-3
+  - read-table-2
+  - focus-text
+  - order-food
+  - sign-agreement
+  - count-sides
+
 # Never used for selection, RFT, or GRPO. Only evaluated, to check that
 # training generalizes and doesn't break other skills.
 heldout_tasks:
