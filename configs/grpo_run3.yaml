@@ -1,0 +1,52 @@
+# Run 3: GRPO on Track B (screenshot only, coordinate clicks), continued from
+# the run-2 adapter, on a mixed and re-screened pool. See docs/PLAN_RUN3.md.
+#
+# Differences from run 2 (grpo_run2.yaml):
+#   - Track B: no AXTree, mouse_click with coordinate [x, y], 10 turns
+#   - a higher sampler floor (0.10), so solved replay tasks keep some rollouts
+#   - checkpoints every 10 steps, because the pod can disappear (no volume)
+#   - a graceful stop flag (results/run3/.stop_grpo) and dashboard samples
+#
+# scripts/run3.sh sets model.adapter (run-2 adapter, or the RFT adapter if the
+# rft phase ran) and runs with CUA_RESULTS_DIR=results/run3, so
+# `tasks: selected` reads the run-3 pool.
+extends: grpo_run2.yaml
+run_name: grpo-4b-run3
+
+model:
+  adapter: null             # set with --set model.adapter=...
+
+env:
+  track: B
+  max_turns: 10             # Track B needs a click before each typing action
+
+grpo:
+  output_dir: /workspace/ckpt/grpo-4b-run3
+  max_steps: 400            # a ceiling; the time cap (GRPO_MAX_HOURS) ends the run first
+  learning_rate: 1.0e-5     # fresh AdamW, same as run 2
+  warmup_steps: 10
+  save_steps: 10            # a lost pod costs at most 10 steps (about 40 minutes)
+  save_total_limit: 4
+  eval_every: 25
+  eval_num_seeds: 20        # 10 seeds swung too much in runs 1 and 2
+
+  # Run 1 used train seeds 1000-1127, run 2 101000 and up (about 100 per task).
+  train_seed_offset: 300000
+
+  sampler: adaptive
+  adaptive:
+    ema_alpha: 0.2
+    floor: 0.10             # run 2: 0.05; replay tasks double as a forgetting alarm
+
+  dynamic_sampling:
+    enabled: true
+    min_mixed_groups: 6
+    max_rounds: 3
+    max_train_groups: 6
+
+  assistant_only_logits: true
+
+  # Run 3 additions (cua/nano_grpo/loop.py). Both paths are relative to the
+  # results folder.
+  stop_file: .stop_grpo     # if this file exists, save and stop at the next step
+  samples_every: 5          # one dashboard sample (results/run3/samples/) every 5 steps

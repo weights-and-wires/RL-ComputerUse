@@ -27,8 +27,13 @@ One GRPO iteration (the numbers match the `# --- N.` section markers in
    `updates_per_step` optimizer steps on the clipped policy-gradient loss.
 6. Sync. Save the LoRA adapter and hand it to vLLM, so the next rollout
    samples from the updated policy.
-7. Log. Write metrics to `metrics.jsonl` and W&B.
+7. Log. Write metrics to `metrics.jsonl` and W&B. Every `samples_every`
+   steps, write one rollout for the run-3 dashboard (`cua/samples.py`).
 8. Checkpoint and evaluate on schedule.
+
+The loop checks for `grpo.stop_file` (run 3: `<results>/.stop_grpo`) before
+each step. When the file exists, it saves a checkpoint and the final adapter
+and exits normally, so the pipeline goes on to its post-training evals.
 
 Why this loop exists: TRL steps its browsers one at a time. Here, step 2 keeps
 dozens of browsers busy at once, which is the main source of speed.
@@ -533,6 +538,60 @@ def build_sampler(cfg: Config, tasks: list[str], seed_start: int):
     )
 
 
+def stop_requested(path: Path | None) -> bool:
+    """True when the graceful-stop flag file exists (run 3: `.stop_grpo`)."""
+    return path is not None and path.exists()
+
+
+def stop_file_path(cfg: Config) -> Path | None:
+    """`grpo.stop_file`, relative to the results folder. None turns the check off."""
+    name = cfg.grpo.get("stop_file")
+    if not name:
+        return None
+    p = Path(str(name))
+    return p if p.is_absolute() else results_dir(cfg) / p
+
+
+def write_wandb_run_json(run, path: Path) -> None:
+    """Writes {"entity", "project", "id", "url"} of the W&B run, for the dashboard."""
+    info = {
+        "entity": getattr(run, "entity", None),
+        "project": getattr(run, "project", None),
+        "id": getattr(run, "id", None),
+        "url": getattr(run, "url", None),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(info, indent=2))
+    os.replace(tmp, path)
+
+
+def trim_metrics(path: Path, last_step: int) -> int:
+    """Drops metric rows with step > last_step, after a resume. Returns how many it dropped.
+
+    Without this, the steps that ran after the checkpoint and were lost with the
+    pod would appear twice in metrics.jsonl.
+    """
+    if not path.exists():
+        return 0
+    kept, dropped = [], 0
+    for line in path.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            dropped += 1  # a half-written line from a crash
+            continue
+        if int(row.get("step", 0)) > last_step:
+            dropped += 1
+            continue
+        kept.append(line)
+    if dropped:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("".join(k + "\n" for k in kept))
+        os.replace(tmp, path)
+    return dropped
+
+
 def init_wandb(cfg: Config, run_id: str | None):
     try:
         import wandb
@@ -591,7 +650,8 @@ def main(argv: list[str] | None = None) -> None:
     max_rounds = int(dyn.get("max_rounds", 3)) if dyn_on else 1
     max_train_groups = int(dyn.get("max_train_groups", 0)) or None  # None: no cap
 
-    state = {"step": 0, "micro_batch_episodes": int(g.micro_batch_episodes), "wandb_run_id": None}
+    state = {"step": 0, "micro_batch_episodes": int(g.micro_batch_episodes), "wandb_run_id": None,
+             "trained_groups_total": 0}
     if resume_from:
         state = load_training_state(resume_from, optimizer, scheduler)
         if "sampler" in state:
@@ -606,8 +666,17 @@ def main(argv: list[str] | None = None) -> None:
 
     run = init_wandb(cfg, state.get("wandb_run_id"))
     state["wandb_run_id"] = run.id if run else None
+    if run:
+        write_wandb_run_json(run, results_dir(cfg) / "wandb_run.json")
     metrics_path = results_dir(cfg) / "train" / cfg.run_name / "metrics.jsonl"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    if resume_from:
+        n = trim_metrics(metrics_path, int(state["step"]))
+        if n:
+            log(f"dropped {n} metric rows past step {state['step']} (they ran after the checkpoint)")
+    stop_path = stop_file_path(cfg)
+    samples_every = int(g.get("samples_every", 0) or 0)
+    trained_groups_total = int(state.get("trained_groups_total", 0))
 
     sampling = SamplingSpec(
         temperature=cfg.generation.temperature, top_p=cfg.generation.top_p,
@@ -617,18 +686,24 @@ def main(argv: list[str] | None = None) -> None:
     checkpoint_args = (model, processor, optimizer, scheduler, out_dir)
 
     def checkpoint() -> None:
-        state.update(step=step, micro_batch_episodes=micro_bs, sampler=sampler.state_dict())
+        state.update(step=step, micro_batch_episodes=micro_bs, sampler=sampler.state_dict(),
+                     trained_groups_total=trained_groups_total)
         state.pop("sampler_pos", None)
         save_checkpoint(*checkpoint_args, state, int(g.save_total_limit))
 
     with EnvPool(cfg) as pool:
         step_done = True
         sampler_snapshot = sampler.state_dict()
+        groups_snapshot = trained_groups_total
         try:
             while step < g.max_steps:
+                if stop_requested(stop_path):
+                    log(f"found {stop_path}: stopping after step {step}")
+                    break
                 step += 1
                 step_done = False  # lets the Ctrl-C handler undo a half-finished step
                 sampler_snapshot = sampler.state_dict()
+                groups_snapshot = trained_groups_total
                 torch.cuda.reset_peak_memory_stats()
                 t0 = time.perf_counter()
 
@@ -649,6 +724,7 @@ def main(argv: list[str] | None = None) -> None:
                     random.shuffle(mixed)
                     mixed = mixed[:max_train_groups]
                 items = [item for group in mixed for item in group]
+                trained_groups_total += len(mixed)
                 counters = {
                     "episodes/crashed": float(num_crashed),
                     "groups/used": float(len(mixed)),
@@ -656,6 +732,8 @@ def main(argv: list[str] | None = None) -> None:
                     "dyn/rounds": float(rounds),
                     "dyn/mixed_groups": float(num_mixed),
                     "dyn/groups_rolled": float(rounds * int(g.prompts_per_step)),
+                    # Run 3 counts progress in trained (mixed) groups, not steps.
+                    "dyn/trained_groups_total": float(trained_groups_total),
                     **{f"task_rate/{t}": r for t, r in sampler.rates().items()},
                     **{f"task_weight/{t}": w for t, w in sampler.weights().items()},
                 }
@@ -708,6 +786,17 @@ def main(argv: list[str] | None = None) -> None:
                             table.add_data(step, ep.task, ep.seed, ep.reward.total, ep.success,
                                            "\n---\n".join(t.generation.text for t in ep.turns)[:1500])
                         run.log({"samples": table}, step=step)
+                if samples_every and step % samples_every == 0:
+                    try:  # the dashboard sample must never stop training
+                        from cua.samples import pick_episode, write_sample
+
+                        keys = {(grp[0][0].task, grp[0][0].seed) for grp in mixed if grp}
+                        ep = pick_episode(episodes, keys, want_success=(step // samples_every) % 2 == 0,
+                                          rng=random.Random(step))
+                        if ep is not None:
+                            write_sample(ep, step, results_dir(cfg))
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"sample writer failed ({type(exc).__name__}: {exc}); continuing")
                 log(
                     f"step {step}: reward={record.get('reward/total', float('nan')):.3f} "
                     f"loss={record.get('loss', float('nan')):.4f} rollout={t_rollout:.0f}s train={t_train:.0f}s"
@@ -731,6 +820,7 @@ def main(argv: list[str] | None = None) -> None:
                 # The interrupted step changed no saved state; replay it on resume.
                 step -= 1
                 sampler.load_state_dict(sampler_snapshot)
+                trained_groups_total = groups_snapshot
             checkpoint()
             sys.exit(130)
 

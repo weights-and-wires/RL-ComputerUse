@@ -13,7 +13,9 @@ set -Eeuo pipefail
 { set +x; } 2>/dev/null
 
 WORKSPACE=/workspace
-REPO="$WORKSPACE/RL-ComputerUse"
+# Run 3 keeps the repository on the container disk (/root/RL-ComputerUse) and
+# sets CUA_REPO; runs 1 and 2 used the default.
+REPO="${CUA_REPO:-$WORKSPACE/RL-ComputerUse}"
 # The venv, uv cache, and model weights live on the pod's local container disk.
 # /workspace is a network filesystem (a network volume, or the pod volume disk in
 # datacenters such as US-KS-2), and writing about 40 GB of small files there took
@@ -25,7 +27,9 @@ VENV="$LOCAL_ROOT/venv"
 UV_HOME="$LOCAL_ROOT/uv"
 HF_HOME_DIR="$LOCAL_ROOT/hf"
 mkdir -p "$LOCAL_ROOT"
-MINIWOB_DIR="$WORKSPACE/miniwob-plusplus"
+# Browsers load every MiniWoB page from here. On a network drive they start
+# slowly, so run 3 sets CUA_MINIWOB_DIR=/root/miniwob-plusplus.
+MINIWOB_DIR="${CUA_MINIWOB_DIR:-$WORKSPACE/miniwob-plusplus}"
 MINIWOB_COMMIT="7fd85d71a4b60325c6585396ec4f48377d049838"
 LOG="$WORKSPACE/logs/bootstrap.log"
 

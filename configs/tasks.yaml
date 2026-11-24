@@ -78,6 +78,57 @@ train_candidates_run2_extra:
   - scroll-text-2
   - odd-or-even
 
+# Run 3 trains Track B (screenshot only, coordinate clicks) and adds these to
+# the run-2 candidates (task list "candidates_run3"). They need pixel positions
+# (SVG shapes, a color wheel, a grid of cells) or a visual reading, so Track A
+# can't do them well. No drag, draw, slider, or hover tasks: Track B has no
+# tool for those. count-sides is held out, so it stays out. See docs/PLAN_RUN3.md.
+train_candidates_run3_extra:
+  - bisect-angle
+  - circle-center
+  - find-midpoint
+  - right-angle
+  - ascending-numbers
+  - use-colorwheel
+  - use-colorwheel-2
+  - visual-addition
+  - tic-tac-toe
+
+# Run 2's training pool (results/run2/selected_tasks.json). Frozen here because
+# results/ isn't in git, and run 3 measures Track-A forgetting on it.
+run2_pool:
+  - choose-list
+  - social-media
+  - email-inbox
+  - choose-date
+  - click-scroll-list
+  - count-shape
+  - form-sequence-2
+  - copy-paste
+  - copy-paste-2
+  - email-inbox-important
+  - email-inbox-star-reply
+  - stock-market
+  - text-transform
+  - guess-number
+  - multi-layouts
+  - use-spinner
+
+# Held-out v2 as run 2 chose it (results/run2/heldout_v2.json). The "heldout_v2"
+# task list reads results/<run>/heldout_v2.json when it exists and falls back
+# to this list, so run 3 evaluates exactly run 2's held-out tasks.
+heldout_v2:
+  - click-test-2
+  - enter-text-2
+  - login-user-popup
+  - click-checkboxes-large
+  - email-inbox-forward-nl
+  - email-inbox-delete
+  - read-table-2
+  - count-sides
+  - sign-agreement
+  - click-checkboxes-transfer
+
 # Run 1's training pool (results/selected_tasks.json from run 1), kept here so
 # run 2 can check retention on it without run 1's results folder.
 run1_pool:

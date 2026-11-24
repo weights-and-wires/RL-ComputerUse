@@ -1,0 +1,28 @@
+# Optional run-3 warm start: rejection-sampling fine-tuning on Track B
+# successes of the run-2 adapter. scripts/run3.sh runs it only when the Track B
+# screen shows a format-error rate of 5% or more (RFT=auto), because run 1
+# showed that RFT mainly fixes the action format and protocol (enter-time
+# +58 points) and adds little elsewhere (+4.8 points overall). See
+# docs/PLAN_RUN3.md.
+extends: rft.yaml
+run_name: rft-4b-run3
+
+model:
+  adapter: null             # run3.sh sets the run-2 adapter
+
+env:
+  track: B
+  max_turns: 10
+
+rft:
+  tasks: selected
+  episodes_per_task: 32
+  max_kept_per_task: 24     # keep easy tasks from dominating
+  require_no_format_errors: true
+  skip_if_format_error_rate_below: 0.05
+  skip_if_mean_success_above: 0.0   # judge by format errors only
+
+sft:
+  output_dir: /workspace/ckpt/rft-4b-run3
+  learning_rate: 2.0e-5     # continuing a trained adapter, not a fresh one (run 1: 1e-4)
+  num_train_epochs: 1

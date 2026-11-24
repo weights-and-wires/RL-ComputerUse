@@ -147,10 +147,19 @@ class TaskSpec:
     train_candidates_run2_extra: list[str] = field(default_factory=list)
     run1_pool: list[str] = field(default_factory=list)
     heldout_v2_candidates: list[str] = field(default_factory=list)
+    train_candidates_run3_extra: list[str] = field(default_factory=list)
+    run2_pool: list[str] = field(default_factory=list)
+    heldout_v2: list[str] = field(default_factory=list)
+    """Run 2's held-out v2 list, frozen in tasks.yaml (results/ isn't in git)."""
 
     @property
     def train_candidates_run2(self) -> list[str]:
         return self.train_candidates + [t for t in self.train_candidates_run2_extra if t not in self.train_candidates]
+
+    @property
+    def train_candidates_run3(self) -> list[str]:
+        base = self.train_candidates_run2
+        return base + [t for t in self.train_candidates_run3_extra if t not in base]
 
     def seed_range(self, name: str) -> SeedRange:
         """Seed range by purpose: 'eval', 'baseline', 'rft', or 'train'."""
@@ -168,6 +177,9 @@ def load_tasks(path: str | os.PathLike = CONFIG_DIR / "tasks.yaml") -> TaskSpec:
         train_candidates_run2_extra=list(data.get("train_candidates_run2_extra") or []),
         run1_pool=list(data.get("run1_pool") or []),
         heldout_v2_candidates=list(data.get("heldout_v2_candidates") or []),
+        train_candidates_run3_extra=list(data.get("train_candidates_run3_extra") or []),
+        run2_pool=list(data.get("run2_pool") or []),
+        heldout_v2=list(data.get("heldout_v2") or []),
     )
     _check_heldout_disjoint(spec)
     return spec
@@ -175,8 +187,8 @@ def load_tasks(path: str | os.PathLike = CONFIG_DIR / "tasks.yaml") -> TaskSpec:
 
 def _check_heldout_disjoint(spec: TaskSpec) -> None:
     """Fail fast if a held-out task could ever be trained on."""
-    train = set(spec.train_candidates_run2)
-    leaked = train & (set(spec.heldout) | set(spec.heldout_v2_candidates))
+    train = set(spec.train_candidates_run3)
+    leaked = train & (set(spec.heldout) | set(spec.heldout_v2_candidates) | set(spec.heldout_v2))
     if leaked:
         raise ValueError(f"held-out tasks also listed as training candidates: {sorted(leaked)}; fix configs/tasks.yaml")
 
@@ -220,11 +232,14 @@ def resolve_task_list(names: list[str] | str, cfg: Optional[Config] = None) -> l
 
     - "candidates": all training candidates from tasks.yaml
     - "candidates_run2": the candidates plus run 2's extra tasks
+    - "candidates_run3": the run-2 candidates plus run 3's Track-B extras
+    - "run2_pool": run 2's training pool (frozen in tasks.yaml)
     - "selected": the pool picked by select_tasks.py
     - "heldout": the held-out generalization tasks
     - "heldout_v2_candidates": tasks screened for the run-2 held-out extension
     - "heldout_v2": the held-out tasks plus the screened extension
-      (results/heldout_v2.json, written by select_tasks.py --heldout-extra)
+      (results/heldout_v2.json, written by select_tasks.py --heldout-extra);
+      without that file, the list frozen in tasks.yaml
     - "run1_pool": run 1's training pool
     - anything else: a literal comma-separated list or a YAML list of names
     """
@@ -234,6 +249,10 @@ def resolve_task_list(names: list[str] | str, cfg: Optional[Config] = None) -> l
             return spec.train_candidates
         if names == "candidates_run2":
             return spec.train_candidates_run2
+        if names == "candidates_run3":
+            return spec.train_candidates_run3
+        if names == "run2_pool":
+            return spec.run2_pool
         if names == "selected":
             return load_selected_tasks(cfg)
         if names == "heldout":
@@ -244,6 +263,8 @@ def resolve_task_list(names: list[str] | str, cfg: Optional[Config] = None) -> l
             return spec.run1_pool
         if names == "heldout_v2":
             path = heldout_v2_path(cfg)
+            if not path.exists() and spec.heldout_v2:
+                return list(spec.heldout_v2)
             if not path.exists():
                 raise FileNotFoundError(f"{path} not found. Run `python -m cua.select_tasks --heldout-extra 5` first.")
             return list(json.loads(path.read_text())["heldout_v2"])

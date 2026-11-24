@@ -62,6 +62,22 @@ PRESETS: dict[str, dict[str, Any]] = {
         "GIF_PAIR": ("rft", "grpo"),
         "SUBTITLE": "Run 2: GRPO continued from the run-1 adapter. Base vs run 1 vs run 2, paired on the same seeds.",
     },
+    # Run 3 (docs/PLAN_RUN3.md): Track B, continued from the run-2 adapter.
+    # Every slot is evaluated on Track B. Track-A forgetting is in
+    # results/run3/compare/trackA-pool2-run3-vs-run2.md.
+    "run3": {
+        "POOLS": {
+            "train": {"base": "base-pool3", "rft": "run2-pool3", "grpo": "run3-pool3"},
+            "heldout": {"base": "base-heldout3", "rft": "run2-heldout3", "grpo": "run3-heldout3"},
+        },
+        "POOL_TITLES": {"train": "Run-3 training pool (Track B)", "heldout": "Held-out v2 pool (Track B)"},
+        "LABELS": {"base": "Base", "rft": "Run 2", "grpo": "Run 3"},
+        "GOAL_POINTS": 10.0,
+        "DELTA_REF": "rft",
+        "GIF_PAIR": ("rft", "grpo"),
+        "SUBTITLE": "Run 3: GRPO on Track B (screenshot only, coordinate clicks), continued from the run-2 adapter. "
+                    "Base vs run 2 vs run 3, all on Track B, paired on the same seeds.",
+    },
 }
 
 
@@ -481,7 +497,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Build results/report/index.html from eval and training outputs.")
     add_config_args(parser, "configs/eval.yaml")
     parser.add_argument("--out", default=None, help="Output directory. Default: results/report.")
-    parser.add_argument("--preset", default=None, help='Run names and labels to use: omit for run 1, or "run2".')
+    parser.add_argument("--preset", default=None, help='Run names and labels to use: omit for run 1, or "run2" or "run3".')
     args = parser.parse_args(argv)
     apply_preset(args.preset)
     cfg = config_from_args(args)

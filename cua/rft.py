@@ -279,7 +279,10 @@ def cmd_train(cfg: Config, dataset_arg: str | None = None) -> None:
     track = cfg.env.track
     tools = actions.tool_schemas(track)
 
-    model, processor = policy.load_hf_model(cfg, trainable=True)
+    # Run 3 continues the run-2 adapter (model.adapter); runs 1 and 2 left it
+    # null, which starts a fresh LoRA on the base model.
+    start_adapter = cfg.model.get("adapter")
+    model, processor = policy.load_hf_model(cfg, adapter=start_adapter, trainable=True)
     # `trainable=True` should return a model with LoRA attached. If it returns
     # a bare base model, attach LoRA here so the optimizer has something to
     # train and the base weights stay frozen.
