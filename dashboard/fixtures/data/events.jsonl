@@ -1,0 +1,7 @@
+{"t": "2026-11-24T10:50:50Z", "kind": "pod_created", "msg": "Pod created: 1x H100 80GB (demo)"}
+{"t": "2026-11-24T11:02:50Z", "kind": "phase_done", "msg": "setup finished"}
+{"t": "2026-11-24T11:02:50Z", "kind": "phase_started", "msg": "baseline started"}
+{"t": "2026-11-24T11:30:50Z", "kind": "phase_done", "msg": "baseline finished"}
+{"t": "2026-11-24T11:30:50Z", "kind": "phase_started", "msg": "grpo started"}
+{"t": "2026-11-24T12:25:50Z", "kind": "restart", "msg": "GRPO process exited (CUDA OOM); restarted from checkpoint 25"}
+{"t": "2026-11-24T13:20:50Z", "kind": "note", "msg": "Demo events: invented for layout, not from run 2."}

@@ -1,0 +1,1 @@
+[{"step": 50, "task": "click-checkboxes-large", "success": true, "reward": 1.04, "dir": "step-000050"}, {"step": 40, "task": "click-checkboxes-large", "success": false, "reward": 0.0, "dir": "step-000040"}, {"step": 30, "task": "click-test-2", "success": true, "reward": 1.04, "dir": "step-000030"}]

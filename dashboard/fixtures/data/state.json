@@ -1,0 +1,60 @@
+{
+ "demo": true,
+ "run_state": "running",
+ "updated": "2026-11-24T14:30:50Z",
+ "started": "2026-11-24T10:50:50Z",
+ "phases": [
+  {
+   "name": "setup",
+   "status": "done",
+   "started": "2026-11-24T10:50:50Z",
+   "finished": "2026-11-24T11:02:50Z"
+  },
+  {
+   "name": "baseline",
+   "status": "done",
+   "started": "2026-11-24T11:02:50Z",
+   "finished": "2026-11-24T11:30:50Z"
+  },
+  {
+   "name": "grpo",
+   "status": "running",
+   "started": "2026-11-24T11:30:50Z",
+   "finished": null
+  },
+  {
+   "name": "post_eval",
+   "status": "pending",
+   "started": null,
+   "finished": null
+  },
+  {
+   "name": "upload",
+   "status": "pending",
+   "started": null,
+   "finished": null
+  }
+ ],
+ "current_phase": "grpo",
+ "grpo": {
+  "step": 52,
+  "max_steps": 80,
+  "last_checkpoint": 50,
+  "synced_checkpoint": 50
+ },
+ "pod": {
+  "id": "demo",
+  "gpu": "1x H100 80GB",
+  "cost_per_hr": 2.99,
+  "uptime_s": 13200,
+  "generation": 1
+ },
+ "spend_usd": 11.01,
+ "budget_usd": 50,
+ "eta": "2026-11-24T15:40:50Z",
+ "restarts": 1,
+ "pod_generations": 1,
+ "wandb_url": "https://wandb.ai/",
+ "hf_url": "https://huggingface.co/",
+ "last_error": null
+}

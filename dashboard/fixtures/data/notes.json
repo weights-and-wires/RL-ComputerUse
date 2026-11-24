@@ -1,0 +1,10 @@
+[
+ {
+  "t": "2026-11-24T13:40:50Z",
+  "text": "Run 2 **demo data** is on screen. Notes support *italics*, `code`, lists and [links](https://example.com)."
+ },
+ {
+  "t": "2026-11-24T14:25:50Z",
+  "text": "- Mixed groups are rising.\n- Next: held-out eval after step 80.\n\n<script>alert(1)</script> is escaped, not run."
+ }
+]

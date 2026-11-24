@@ -1,0 +1,14 @@
+[Unit]
+Description=CUA run 3 live dashboard (read-only web server)
+After=network-online.target
+
+[Service]
+ExecStart=/home/linuxbrew/.linuxbrew/bin/python3 %h/cua-run3/dashboard/server.py --data %h/cua-run3/data --port 8790
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

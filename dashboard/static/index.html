@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run 3 live</title>
+<meta name="description" content="Live dashboard for run 3: GRPO post-training of Qwen3-VL-4B on MiniWoB++ browser tasks with pixel-coordinate clicks.">
+<meta name="theme-color" content="#F6F1E7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1A1714" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%232A2420'/%3E%3Cpath d='M16 6v20M6 16h20' stroke='%23F6F1E7' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='5' fill='none' stroke='%23E07A63' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..600,50;1,9..144,300..600,50&family=Hanken+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+<link rel="stylesheet" href="almanac.css">
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="top" id="top">
+  <div class="top-bar">
+    <span class="alm-eyebrow">Run 3 &middot; Track B &middot; Qwen3-VL-4B</span>
+    <button class="theme" id="theme" type="button" aria-label="Switch colour theme">auto</button>
+  </div>
+  <h1 class="hero">A small model learns to <em>click.</em></h1>
+  <p class="lede">Reinforcement learning on one rented GPU: the model sees a browser screenshot, answers with a click position, and gets a reward when the task is done. This page follows the run as it happens.</p>
+  <div class="status-row">
+    <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">loading</span></span>
+    <span class="alm-data" id="updated">connecting&hellip;</span>
+    <span class="alm-data" id="phase-now"></span>
+  </div>
+  <div class="banner" id="demo-banner" hidden>Showing run 2 demo data &mdash; run 3 hasn't started.</div>
+  <div class="banner warn" id="stale-banner" hidden></div>
+  <div class="banner warn" id="error-banner" hidden></div>
+</header>
+
+<section id="cost" aria-labelledby="h-cost">
+  <div class="sec-head"><span class="alm-eyebrow">01 &middot; Money</span><h2 id="h-cost">What it costs</h2></div>
+  <div class="stats" id="cost-stats"></div>
+  <div class="meter" id="budget-meter" aria-hidden="true"></div>
+  <p class="alm-small" id="cost-note"></p>
+</section>
+
+<section id="progress" aria-labelledby="h-progress">
+  <div class="sec-head"><span class="alm-eyebrow">02 &middot; Progress</span><h2 id="h-progress">Where the run is</h2></div>
+  <div class="phasebar" id="phasebar" role="img" aria-label="Phase progress"></div>
+  <ol class="phases" id="phase-list"></ol>
+  <div class="grpo" id="grpo">
+    <div class="grpo-head"><span class="alm-label">GRPO steps</span><span class="alm-data" id="grpo-text"></span></div>
+    <div class="track" id="grpo-track"></div>
+    <div class="alm-small" id="grpo-note"></div>
+  </div>
+</section>
+
+<section id="training" aria-labelledby="h-training">
+  <div class="sec-head"><span class="alm-eyebrow">03 &middot; Learning</span><h2 id="h-training">Training curves</h2></div>
+  <div class="controls">
+    <label class="alm-label" for="smooth">Smoothing</label>
+    <input type="range" id="smooth" min="0" max="0.95" step="0.05" value="0.6">
+    <span class="alm-data" id="smooth-val">0.60</span>
+    <span class="alm-small">Faint line: each step. Solid line: smoothed (EMA).</span>
+  </div>
+  <h3 class="sub">Is it getting better?</h3>
+  <div class="grid" id="g-signal"></div>
+  <h3 class="sub">Is each step teaching it anything?</h3>
+  <div class="grid" id="g-groups"></div>
+  <h3 class="sub">The optimiser</h3>
+  <div class="grid" id="g-optim"></div>
+  <h3 class="sub">Speed and memory</h3>
+  <div class="grid" id="g-speed"></div>
+  <details class="more" id="more-wrap" hidden>
+    <summary>Other metrics in the log</summary>
+    <div class="grid" id="g-more"></div>
+  </details>
+</section>
+
+<section id="tasks" aria-labelledby="h-tasks">
+  <div class="sec-head"><span class="alm-eyebrow">04 &middot; Task by task</span><h2 id="h-tasks">Rollout success per task</h2></div>
+  <p class="alm-small">Dots: the share of attempts that succeeded on that task in a step. Line: the tracked success rate the trainer uses to choose what to practise.</p>
+  <div class="grid small" id="g-tasks"></div>
+</section>
+
+<section id="system" aria-labelledby="h-system">
+  <div class="sec-head"><span class="alm-eyebrow">05 &middot; Machine</span><h2 id="h-system">The GPU</h2></div>
+  <div class="grid" id="g-system"></div>
+</section>
+
+<section id="evals" aria-labelledby="h-evals">
+  <div class="sec-head"><span class="alm-eyebrow">06 &middot; Exams</span><h2 id="h-evals">Before and after</h2></div>
+  <p class="alm-small">Success rate per task, with 95% confidence whiskers. <em>Held-out</em> tasks were never trained on; <em>pool</em> tasks are the ones it practised.</p>
+  <div id="eval-panels"></div>
+  <div class="table-wrap"><table class="tbl" id="eval-table"></table></div>
+</section>
+
+<section id="samples" aria-labelledby="h-samples">
+  <div class="sec-head"><span class="alm-eyebrow">07 &middot; Evidence</span><h2 id="h-samples">What the model actually does</h2></div>
+  <p class="alm-small">Each ring is the click the model chose, drawn where its answer says it clicked. Select a sample to read the full exchange.</p>
+  <div class="gallery" id="gallery"></div>
+  <div class="detail" id="sample-detail" hidden></div>
+</section>
+
+<section id="log" aria-labelledby="h-log">
+  <div class="sec-head"><span class="alm-eyebrow">08 &middot; Console</span><h2 id="h-log">Live log</h2></div>
+  <div class="logbar">
+    <input type="search" id="log-filter" placeholder="Filter lines" aria-label="Filter log lines" autocomplete="off">
+    <button type="button" class="alm-btn alm-btn--outline alm-btn--dense" id="log-auto" aria-pressed="true">Auto-scroll: on</button>
+    <span class="alm-data" id="log-status">connecting&hellip;</span>
+  </div>
+  <div class="logbox" id="logbox" tabindex="0" role="log" aria-label="Run log"></div>
+  <div class="alm-data" id="log-count"></div>
+</section>
+
+<section id="timeline" aria-labelledby="h-timeline">
+  <div class="sec-head"><span class="alm-eyebrow">09 &middot; Record</span><h2 id="h-timeline">Timeline and notes</h2></div>
+  <div class="two">
+    <div><h3 class="sub">Events</h3><ol class="events" id="events"></ol></div>
+    <div><h3 class="sub">Notes</h3><div class="notes" id="notes"></div></div>
+  </div>
+  <div class="links" id="links"></div>
+</section>
+
+<section id="explain" aria-labelledby="h-explain">
+  <div class="sec-head"><span class="alm-eyebrow">10 &middot; For newcomers</span><h2 id="h-explain">What is going on?</h2></div>
+  <div class="prose">
+    <p>A language model that can see images (Qwen3-VL, four billion parameters) is shown a small web page from <strong>MiniWoB++</strong>, a suite of toy browser tasks such as &ldquo;click the blue button&rdquo; or &ldquo;pick the date&rdquo;. It answers with an action. If the page ends in the right state, it gets a reward. We nudge the model towards answers that earned more reward and repeat. That is reinforcement learning.</p>
+    <p>The run rents one H100 GPU by the hour. A small program on a home machine creates the GPU, restarts what crashes, tracks the bill against a <strong>$50 cap</strong>, uploads the results, and deletes the GPU. If the GPU vanishes, a new one resumes from the last saved checkpoint.</p>
+  </div>
+  <dl class="gloss">
+    <dt>GRPO</dt><dd>Group Relative Policy Optimization. For each task the model makes several attempts at once (a <em>group</em>). Attempts that scored above the group's average are made more likely; those below are made less likely. No separate &ldquo;critic&rdquo; model is needed.</dd>
+    <dt>Track B</dt><dd>The model sees only a screenshot and must answer with pixel coordinates, such as <code>click(coordinate=[412, 230])</code>, on a 0&ndash;1000 grid. Track A, used in earlier runs, instead named page elements by an ID. Track B is harder and closer to how people use a screen.</dd>
+    <dt>Mixed group</dt><dd>A group in which some attempts succeeded and some failed. Only these teach the model anything. If every attempt wins or every attempt loses, the group is <em>zero-variance</em> and is thrown away.</dd>
+    <dt>Dynamic sampling</dt><dd>When too many groups are zero-variance, the trainer plays more rounds to find mixed ones. &ldquo;Rounds&rdquo; counts how many it needed for a step.</dd>
+    <dt>Held-out</dt><dd>Tasks the model never practised. Doing well on them suggests it learned something general rather than memorising.</dd>
+    <dt>Pool</dt><dd>The set of tasks used for training. Scores here show how well practice paid off.</dd>
+    <dt>EMA</dt><dd>Exponential moving average: a smoothed line that gives recent steps more weight so noisy curves are readable.</dd>
+    <dt>KL</dt><dd>How far the model has drifted from where it started. Small is safe; a sharp rise can mean it is breaking.</dd>
+    <dt>Clip fraction</dt><dd>The share of updates that hit the safety limit on how much one step may change the model.</dd>
+    <dt>Entropy</dt><dd>How undecided the model is between answers. It usually falls as training sharpens its choices.</dd>
+    <dt>Gradient norm</dt><dd>The size of the update before it is applied. Spikes are a warning sign.</dd>
+    <dt>Checkpoint</dt><dd>A saved copy of the model's progress. Checkpoints are synced to Hugging Face so a new GPU can resume.</dd>
+    <dt>Adapter (LoRA)</dt><dd>A small set of extra weights trained on top of the frozen base model, which keeps training cheap.</dd>
+    <dt>95% interval</dt><dd>The range the true success rate probably lies in, given how many attempts were measured. Overlapping ranges mean the difference may be luck.</dd>
+  </dl>
+</section>
+
+<footer class="foot">
+  <span class="alm-data">This page is read-only and updates every 15 seconds. It never shows keys or tokens.</span>
+</footer>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

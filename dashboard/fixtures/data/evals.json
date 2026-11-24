@@ -1,0 +1,254 @@
+{
+ "base-heldout2": {
+  "mode": "greedy",
+  "track": "A",
+  "tasks": {
+   "click-checkboxes-large": {
+    "success": 0.39,
+    "n": 100
+   },
+   "click-checkboxes-transfer": {
+    "success": 1.0,
+    "n": 100
+   },
+   "click-test-2": {
+    "success": 0.89,
+    "n": 100
+   },
+   "count-sides": {
+    "success": 0.89,
+    "n": 100
+   },
+   "email-inbox-delete": {
+    "success": 0.6,
+    "n": 100
+   },
+   "email-inbox-forward-nl": {
+    "success": 0.0,
+    "n": 100
+   },
+   "enter-text-2": {
+    "success": 0.86,
+    "n": 100
+   },
+   "login-user-popup": {
+    "success": 0.78,
+    "n": 100
+   },
+   "read-table-2": {
+    "success": 0.88,
+    "n": 100
+   },
+   "sign-agreement": {
+    "success": 0.0,
+    "n": 100
+   }
+  },
+  "mean": 0.629,
+  "ci95": [
+   0.5986,
+   0.6584
+  ]
+ },
+ "run2-heldout2": {
+  "mode": "greedy",
+  "track": "A",
+  "tasks": {
+   "click-checkboxes-large": {
+    "success": 0.42,
+    "n": 100
+   },
+   "click-checkboxes-transfer": {
+    "success": 1.0,
+    "n": 100
+   },
+   "click-test-2": {
+    "success": 0.91,
+    "n": 100
+   },
+   "count-sides": {
+    "success": 0.92,
+    "n": 100
+   },
+   "email-inbox-delete": {
+    "success": 0.65,
+    "n": 100
+   },
+   "email-inbox-forward-nl": {
+    "success": 0.17,
+    "n": 100
+   },
+   "enter-text-2": {
+    "success": 0.83,
+    "n": 100
+   },
+   "login-user-popup": {
+    "success": 0.94,
+    "n": 100
+   },
+   "read-table-2": {
+    "success": 0.83,
+    "n": 100
+   },
+   "sign-agreement": {
+    "success": 0.06,
+    "n": 100
+   }
+  },
+  "mean": 0.673,
+  "ci95": [
+   0.6433,
+   0.7014
+  ]
+ },
+ "base-pool2": {
+  "mode": "greedy",
+  "track": "A",
+  "tasks": {
+   "choose-date": {
+    "success": 0.32,
+    "n": 50
+   },
+   "choose-list": {
+    "success": 0.98,
+    "n": 50
+   },
+   "click-scroll-list": {
+    "success": 0.38,
+    "n": 50
+   },
+   "copy-paste": {
+    "success": 0.58,
+    "n": 50
+   },
+   "copy-paste-2": {
+    "success": 0.18,
+    "n": 50
+   },
+   "count-shape": {
+    "success": 0.08,
+    "n": 50
+   },
+   "email-inbox": {
+    "success": 0.06,
+    "n": 50
+   },
+   "email-inbox-important": {
+    "success": 0.18,
+    "n": 50
+   },
+   "email-inbox-star-reply": {
+    "success": 0.1,
+    "n": 50
+   },
+   "form-sequence-2": {
+    "success": 1.0,
+    "n": 50
+   },
+   "guess-number": {
+    "success": 1.0,
+    "n": 50
+   },
+   "multi-layouts": {
+    "success": 0.58,
+    "n": 50
+   },
+   "social-media": {
+    "success": 0.06,
+    "n": 50
+   },
+   "stock-market": {
+    "success": 0.48,
+    "n": 50
+   },
+   "text-transform": {
+    "success": 0.62,
+    "n": 50
+   },
+   "use-spinner": {
+    "success": 0.86,
+    "n": 50
+   }
+  },
+  "mean": 0.4662,
+  "ci95": [
+   0.4319,
+   0.5009
+  ]
+ },
+ "run2-pool2": {
+  "mode": "greedy",
+  "track": "A",
+  "tasks": {
+   "choose-date": {
+    "success": 0.46,
+    "n": 50
+   },
+   "choose-list": {
+    "success": 0.98,
+    "n": 50
+   },
+   "click-scroll-list": {
+    "success": 0.52,
+    "n": 50
+   },
+   "copy-paste": {
+    "success": 1.0,
+    "n": 50
+   },
+   "copy-paste-2": {
+    "success": 1.0,
+    "n": 50
+   },
+   "count-shape": {
+    "success": 0.22,
+    "n": 50
+   },
+   "email-inbox": {
+    "success": 0.54,
+    "n": 50
+   },
+   "email-inbox-important": {
+    "success": 1.0,
+    "n": 50
+   },
+   "email-inbox-star-reply": {
+    "success": 0.72,
+    "n": 50
+   },
+   "form-sequence-2": {
+    "success": 1.0,
+    "n": 50
+   },
+   "guess-number": {
+    "success": 1.0,
+    "n": 50
+   },
+   "multi-layouts": {
+    "success": 0.58,
+    "n": 50
+   },
+   "social-media": {
+    "success": 0.4,
+    "n": 50
+   },
+   "stock-market": {
+    "success": 0.48,
+    "n": 50
+   },
+   "text-transform": {
+    "success": 0.76,
+    "n": 50
+   },
+   "use-spinner": {
+    "success": 0.96,
+    "n": 50
+   }
+  },
+  "mean": 0.7262,
+  "ci95": [
+   0.6943,
+   0.756
+  ]
+ }
+}
