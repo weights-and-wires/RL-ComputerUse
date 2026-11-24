@@ -1,0 +1,15 @@
+# Demo dependencies. These run on a laptop (macOS or Linux) without vLLM.
+# Keep the model-stack pins the same as pyproject.toml, so the demo builds
+# prompts and parses replies exactly as training and evaluation did.
+torch
+torchvision          # the Qwen3-VL processor loads a video processor that needs it
+transformers==5.20.2
+peft==0.21.3
+browsergym-miniwob==0.14.3
+browsergym-core==0.14.3
+playwright==1.44.0
+gymnasium
+pillow
+numpy
+pyyaml
+huggingface_hub      # provides the `hf` command that downloads the adapters

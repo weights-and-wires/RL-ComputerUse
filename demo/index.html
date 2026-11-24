@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Replay Desk</title>
+<style>
+:root {
+  --bg: #f2f4f8; --surface: #fff; --sunk: #e8ecf3; --ink: #172031; --muted: #586379;
+  --line: #d4dae5; --accent: #2f4bd1; --accent-soft: #e2e7fc;
+  --good: #17845a; --good-soft: #dcf2e8; --bad: #c9412f; --bad-soft: #fae3df; --warn: #9a6a00;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e131d; --surface: #161d2b; --sunk: #1d2536; --ink: #e6eaf2; --muted: #9ba5b9;
+    --line: #2b3549; --accent: #8fa2ff; --accent-soft: #232d55;
+    --good: #4fca92; --good-soft: #15352a; --bad: #f2806f; --bad-soft: #3d2023; --warn: #e3b450;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--surface); }
+header h1 { font-size: 1.15rem; margin: 0; }
+#status { font-size: 0.85rem; color: var(--muted); }
+#status.ready { color: var(--good); }
+#status.error { color: var(--bad); }
+main { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 20px; padding: 20px; max-width: 1400px; margin: 0 auto; }
+@media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+aside { display: grid; gap: 16px; align-content: start; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: grid; gap: 10px; }
+.panel h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin: 4px 0 0; }
+.tasks { display: grid; gap: 6px; }
+.task { text-align: left; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; }
+.task:hover { border-color: var(--accent); }
+.task[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.task .name { font-family: var(--mono); font-size: 0.85rem; }
+.task .score { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
+.task .tag { grid-column: 1 / -1; font-size: 0.72rem; color: var(--muted); }
+label { font-size: 0.85rem; color: var(--muted); display: grid; gap: 4px; }
+select, input { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.row { display: flex; gap: 8px; }
+.row > * { flex: 1; }
+button.act { font: inherit; font-weight: 600; border-radius: 8px; padding: 8px 12px; cursor: pointer; border: 1px solid var(--accent); background: var(--accent); color: var(--surface); }
+button.act.secondary { background: var(--surface); color: var(--ink); border-color: var(--line); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.scores { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; text-align: center; }
+.scores div { background: var(--bg); border-radius: 6px; padding: 6px; }
+.scores b { display: block; font-family: var(--mono); font-size: 1.05rem; }
+.scores span { font-size: 0.72rem; color: var(--muted); }
+#about { font-size: 0.88rem; margin: 0; }
+#msg { font-size: 0.85rem; color: var(--bad); min-height: 1.2em; margin: 0; }
+
+section#stage { display: grid; gap: 14px; align-content: start; min-width: 0; }
+.goal { background: #f7e98a; color: #2a2610; border-radius: 8px; padding: 10px 14px; font-weight: 600; }
+.meta { font-size: 0.85rem; color: var(--muted); }
+.empty { color: var(--muted); background: var(--surface); border: 1px dashed var(--line); border-radius: 10px; padding: 40px 20px; text-align: center; }
+.turn { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 760px) { .turn { grid-template-columns: 1fr; } }
+.turn img { width: 100%; border-radius: 6px; border: 1px solid var(--line); image-rendering: auto; }
+.turn h3 { margin: 0 0 6px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.reason { margin: 0 0 8px; }
+.action { font-family: var(--mono); font-size: 0.88rem; background: var(--accent-soft); border-radius: 6px; padding: 6px 8px; overflow-wrap: anywhere; }
+.note { font-size: 0.85rem; color: var(--warn); margin-top: 6px; }
+details { margin-top: 8px; font-size: 0.82rem; }
+details pre { white-space: pre-wrap; font-family: var(--mono); font-size: 0.75rem; background: var(--sunk); border-radius: 6px; padding: 8px; max-height: 260px; overflow: auto; }
+.thinking { display: flex; gap: 10px; align-items: center; color: var(--muted); padding: 10px 4px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+@media (prefers-reduced-motion: no-preference) { .dot { animation: blink 1s ease-in-out infinite; } @keyframes blink { 50% { opacity: 0.25; } } }
+.result { border-radius: 10px; padding: 14px; font-weight: 700; font-size: 1.05rem; }
+.result.win { background: var(--good-soft); color: var(--good); }
+.result.lose { background: var(--bad-soft); color: var(--bad); }
+.result small { display: block; font-weight: 400; font-size: 0.85rem; color: var(--ink); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent replay desk</h1>
+  <span id="status">Connecting…</span>
+</header>
+<main>
+  <aside>
+    <div class="panel">
+      <h2>1. Pick a task</h2>
+      <div id="task-list"></div>
+    </div>
+    <div class="panel">
+      <h2>2. Run it</h2>
+      <p id="about">Select a task from the list.</p>
+      <div class="scores" id="scores" hidden>
+        <div><b id="s-base">-</b><span>Original</span></div>
+        <div><b id="s-run1">-</b><span>Run 1</span></div>
+        <div><b id="s-run2">-</b><span>Run 2</span></div>
+      </div>
+      <div class="row">
+        <label for="model">Model<select id="model"></select></label>
+        <label for="seed">Seed (blank = random)<input id="seed" type="number" min="0" max="99" placeholder="0-99"></label>
+      </div>
+      <div class="row">
+        <button class="act" id="run" type="button" disabled>Run episode</button>
+        <button class="act secondary" id="stop" type="button" disabled>Stop</button>
+      </div>
+      <p id="msg" role="alert"></p>
+    </div>
+  </aside>
+  <section id="stage" aria-live="polite">
+    <div class="empty">Pick a task and select <strong>Run episode</strong>. Each turn appears here as the model takes it: what it saw, what it wrote, and what it did.</div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let info = null, selected = null, runId = null, seen = 0, polling = null;
+
+function pct(v) { return v == null ? "-" : v + "%"; }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+async function loadInfo() {
+  try {
+    info = await (await fetch("/api/info")).json();
+  } catch (e) {
+    $("status").textContent = "Can't reach the demo server. Is it still running?";
+    $("status").className = "error";
+    setTimeout(loadInfo, 3000);
+    return;
+  }
+  $("status").textContent = info.status === "ready" ? "Ready. " + info.detail : info.detail;
+  $("status").className = info.status;
+  if (!$("task-list").childElementCount) renderTasks();
+  if (info.status === "ready" && !$("model").childElementCount) {
+    for (const m of info.models) {
+      const o = document.createElement("option");
+      o.value = m.id; o.textContent = m.label;
+      $("model").appendChild(o);
+    }
+    $("model").value = info.models.some((m) => m.id === "run2") ? "run2" : info.models[0].id;
+  }
+  updateButtons();
+  if (info.status === "loading" || info.status === "starting") setTimeout(loadInfo, 2000);
+}
+
+function renderTasks() {
+  const groups = [["good", "The model is good at these"], ["moderate", "Moderately difficult"]];
+  const box = $("task-list");
+  for (const [g, title] of groups) {
+    const h = document.createElement("h2"); h.textContent = title; box.appendChild(h);
+    const list = document.createElement("div"); list.className = "tasks"; box.appendChild(list);
+    for (const t of info.tasks.filter((x) => x.group === g)) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "task"; b.setAttribute("aria-pressed", "false");
+      b.innerHTML = `<span class="name">${esc(t.task)}</span><span class="score">run 2: ${pct(t.run2)}</span>` +
+        (t.held_out ? `<span class="tag">Held-out task: never practiced</span>` : "");
+      b.addEventListener("click", () => selectTask(t, b));
+      list.appendChild(b);
+    }
+  }
+}
+
+function selectTask(t, btn) {
+  selected = t;
+  document.querySelectorAll(".task").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+  $("about").textContent = t.about;
+  $("scores").hidden = false;
+  $("s-base").textContent = pct(t.base); $("s-run1").textContent = pct(t.run1); $("s-run2").textContent = pct(t.run2);
+  updateButtons();
+}
+
+function updateButtons() {
+  const busy = runId !== null;
+  $("run").disabled = !(info && info.status === "ready" && selected && !busy);
+  $("stop").disabled = !busy;
+}
+
+$("run").addEventListener("click", async () => {
+  $("msg").textContent = "";
+  const body = { task: selected.task, model: $("model").value, seed: $("seed").value };
+  const res = await fetch("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) { $("msg").textContent = data.error; return; }
+  runId = data.id; seen = 0;
+  $("stage").innerHTML = "";
+  updateButtons();
+  showThinking("Opening the page…");
+  poll();
+});
+
+$("stop").addEventListener("click", async () => {
+  await fetch("/api/stop", { method: "POST", body: "{}" });
+  showThinking("Stopping after the current turn…");
+});
+
+function showThinking(text) {
+  let t = document.querySelector(".thinking");
+  if (!t) { t = document.createElement("div"); t.className = "thinking"; t.innerHTML = '<span class="dot"></span><span></span>'; $("stage").appendChild(t); }
+  t.lastChild.textContent = text;
+}
+function clearThinking() { document.querySelector(".thinking")?.remove(); }
+
+async function poll() {
+  if (runId === null) return;
+  let data;
+  try { data = await (await fetch(`/api/run/${runId}?since=${seen}`)).json(); }
+  catch (e) { setTimeout(poll, 1500); return; }
+  for (const ev of data.events) { seen += 1; render(ev); }
+  if (data.done) { clearThinking(); runId = null; updateButtons(); return; }
+  setTimeout(poll, 600);
+}
+
+function render(ev) {
+  clearThinking();
+  const stage = $("stage");
+  if (ev.type === "start") {
+    const label = (info.models.find((m) => m.id === ev.model) || {}).label || ev.model;
+    stage.insertAdjacentHTML("beforeend",
+      `<div class="goal">${esc(ev.goal)}</div>
+       <div class="meta"><code>${esc(ev.task)}</code> · seed ${ev.seed} · ${esc(label)}</div>
+       <div class="turn"><div><img src="${ev.screenshot}" alt="The page before the first action"></div>
+         <div><h3>Start</h3><p class="reason">This is the page the model sees first, with the list of page elements.</p>
+         <details><summary>Page elements the model reads</summary><pre>${esc(ev.elements)}</pre></details></div></div>`);
+    showThinking("The model is reading the page…");
+  } else if (ev.type === "turn") {
+    const action = ev.action ? esc(ev.action) : esc(ev.tool ? `${ev.tool}(${JSON.stringify(ev.args)})` : "(no action)");
+    const img = ev.screenshot ? `<img src="${ev.screenshot}" alt="The page after turn ${ev.turn}">` : `<div class="meta">The browser didn't change.</div>`;
+    const notes = [ev.note, ev.page_error && "Page error: " + ev.page_error, ev.format_error && "Format problem: " + ev.format_error].filter(Boolean);
+    stage.insertAdjacentHTML("beforeend",
+      `<div class="turn"><div>${img}</div><div>
+        <h3>Turn ${ev.turn} of ${info.max_turns} · ${ev.think_s}s to decide</h3>
+        <p class="reason">${esc(ev.reasoning || "(no reasoning written)")}</p>
+        <div class="action">${action}</div>
+        ${notes.map((n) => `<div class="note">${esc(n)}</div>`).join("")}
+        <details><summary>Full model reply</summary><pre>${esc(ev.reply)}</pre></details>
+        ${ev.elements ? `<details><summary>Page elements after this action</summary><pre>${esc(ev.elements)}</pre></details>` : ""}
+      </div></div>`);
+    showThinking("The model is deciding its next action…");
+  } else if (ev.type === "end") {
+    stage.insertAdjacentHTML("beforeend",
+      `<div class="result ${ev.success ? "win" : "lose"}">${ev.success ? "✓ Task done: reward 1" : "✗ Not done: reward 0"}<small>${esc(ev.reason)}</small></div>`);
+  } else if (ev.type === "error") {
+    stage.insertAdjacentHTML("beforeend", `<div class="result lose">Something went wrong<small>${esc(ev.message)}</small></div>`);
+  }
+  const calm = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  stage.lastElementChild?.scrollIntoView({ behavior: calm ? "auto" : "smooth", block: "nearest" });
+}
+
+loadInfo();
+</script>
+</body>
+</html>

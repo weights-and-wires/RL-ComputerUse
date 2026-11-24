@@ -9,3 +9,6 @@ wandb/
 .ruff_cache/
 results_test_run/
 .DS_Store
+.demo/
+.cloudflare/
+results_live/

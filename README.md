@@ -36,3 +36,27 @@ The dependencies include vLLM, which installs only on Linux with an NVIDIA GPU, 
 the tests and smoke tests on the pod (`pytest -q tests`, `python -m cua.env --task click-button --seed 0`).
 
 The pod bills every hour until you stop or delete it.
+
+## Watch the model do tasks
+
+The demo runs on your laptop, with no pod. It loads the model with Hugging Face
+transformers (Apple silicon GPU, CUDA, or CPU), drives a headless Chromium
+browser, and serves a page where you pick a task and watch each turn: the
+screenshot, the model's reasoning, its action, and the reward.
+
+To start it, run the following command from the repository root:
+
+```bash
+scripts/demo.sh
+```
+
+The first run installs everything into `.demo/`, downloads the run-1 and run-2
+adapters from the private Hugging Face repository (it needs `HF_TOKEN`), and
+downloads the 9 GB base model. Then it opens `http://127.0.0.1:8000/`.
+
+- To also watch a visible, slowed-down Chromium window, add `--show-browser`.
+- To compare models, pick **Original model**, **Run 1**, or **Run 2** in the UI.
+- Pages come from the eval seeds (0-99), which no training run used.
+
+Each turn takes several seconds on a laptop. Results can differ a little from
+the published scores, because evaluation ran in vLLM on a GPU.
