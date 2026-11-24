@@ -136,7 +136,7 @@ else
   git ls-files -co --exclude-standard \
     | grep -vE '^(\.env|\.[^/]+/|results/|results_live/|demo/)' \
     | while IFS= read -r f; do [[ -e "$f" ]] && printf '%s\n' "$f"; done > "$list"
-  rev="$(git rev-parse HEAD)$( [[ -n "$(git status --porcelain)" ]] && echo '+dirty')"
+  rev="$(git rev-parse HEAD)$( [[ -z "$(git status --porcelain)" ]] || echo '+dirty')"
   COPYFILE_DISABLE=1 tar -czf - -T "$list" \
     | B "set -e; cd ~/cua-run3; rm -rf repo.new; mkdir repo.new; tar -xzf - -C repo.new 2>/dev/null
          echo '$rev' > repo.new/REVISION; rm -rf repo; mv repo.new repo
@@ -147,7 +147,11 @@ for f in scripts/run3_pod_start.sh scripts/run3.sh scripts/upload_run3.py; do
   B "test -f ~/cua-run3/repo/$f" || { echo "ERROR: ~/cua-run3/repo/$f is missing. Not starting." >&2; exit 1; }
 done
 
-ARM="{\"t\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"by\": \"run3_go.sh\"$( [[ -n "$ADOPT" ]] && printf ', "adopt": "%s"' "$ADOPT")}"
+# Under set -e, an assignment whose command substitution fails ends the
+# script, so each substitution here must exit 0.
+ADOPT_JSON=""
+[[ -z "$ADOPT" ]] || ADOPT_JSON="$(printf ', "adopt": "%s"' "$ADOPT")"
+ARM="{\"t\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"by\": \"run3_go.sh\"$ADOPT_JSON}"
 B "set -e; systemctl --user stop cua-run3-monitor 2>/dev/null || true
    cd ~/cua-run3
    if [ -f state.json ]; then mv state.json state.\$(date +%Y%m%d-%H%M%S).json; fi
