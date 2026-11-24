@@ -1,0 +1,20 @@
+[Unit]
+Description=CUA run 3 monitor (creates and watches the Runpod pod)
+Documentation=file://%h/cua-run3/monitor/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/cua-run3
+# The monitor creates a pod only while ~/cua-run3/ARMED exists (run3_go.sh writes it),
+# so starting this unit at boot is safe.
+ExecStart=/usr/bin/python3 -u %h/cua-run3/monitor/monitor.py run
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
