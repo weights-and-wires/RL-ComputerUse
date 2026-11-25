@@ -1,6 +1,6 @@
-"""Collector and note writer for the run-3 monitor. Both run as threads in the monitor.
+"""Collector and note writer for the run monitor. Both run as threads in the monitor.
 
-The collector fills ~/cua-run3/data/ every 60 s while a pod is up. Every
+The collector fills the run's data/ folder every 60 s while a pod is up. Every
 failure here is logged and swallowed: the collector must never break the
 monitor.
 """
@@ -59,11 +59,14 @@ class Collector:
         if conn is None:
             return False
         c = self.cache()
+        c.pop("reread", None)
         if c["metrics_pod"] != rec.get("id"):
-            # New pod: its restored metrics.jsonl may differ in length, so read it
-            # from the start and rely on step de-duplication.
+            # New pod: its restored metrics.jsonl may differ from the copy, so read
+            # it from the start and treat it like a rewritten file.
             c["metrics_offset"], c["metrics_pod"] = 0, rec.get("id")
-        r = conn.run(f"python3 - --metrics-offset {int(c['metrics_offset'])} --log-lines 2000", stdin=PROBE, timeout=120)
+            c["reread"] = True
+        r = conn.run(f"python3 - --metrics-offset {int(c['metrics_offset'])} --log-lines 2000 "
+                     f"--run {self.paths.run}", stdin=PROBE, timeout=120)
         if not r.ok:
             self.mon.log(f"collector: probe failed (rc {r.rc}): {r.err.strip()[-200:]}")
             return False
@@ -74,6 +77,7 @@ class Collector:
             self.mon.log("collector: probe printed no JSON")
             return False
         self.apply_probe(probe, c, conn)
+        c.pop("reread", None)
         self.save_cache(c)
         return True
 
@@ -109,51 +113,47 @@ class Collector:
     # --- pieces ---------------------------------------------------------------------
 
     def metrics(self, m, c: dict) -> None:
+        """Copy new metric rows from the pod.
+
+        Normally the probe returns only the bytes after the saved offset, and the
+        collector appends them as they are. A step number that appears twice is
+        normal: a mid-training eval row shares the step of a training row, and
+        rows with a `kind` field (train or eval) or different keys are distinct rows.
+
+        Only a rewritten pod file can change rows that the copy already holds.
+        That happens when GRPO resumes from a checkpoint (the pod trims the file
+        and replays the later steps) or when a new pod restores the file. The
+        probe reports it as `reset` (the saved offset was past the end or not on a
+        line boundary) and re-reads from byte 0. The collector treats a new pod
+        the same way. Then the pod's file is the truth: the copy keeps its common
+        prefix with the pod's rows and takes the pod's rows from there on.
+        """
         if not m:
             return
-        # If the pod's file shrank (a restored pod), the probe reads it from the
-        # start; rows at or below the last step seen are skipped.
-        rows = []
-        last = c.get("last_step")
-        if last is None:
-            local = read_jsonl(self.paths.d("metrics.jsonl"))
-            steps = [r.get("step") for r in local if isinstance(r.get("step"), (int, float))]
-            last = max(steps) if steps else None
-        # A GRPO resume replays the steps after its checkpoint, and the pod trims
-        # those rows from its own file. Rows at or below the last step seen are
-        # either already copied (a re-read from offset 0) or replays. Replays
-        # arrive as new data after the checkpoint step, so the first new row
-        # whose step is at or below `last` and that the local copy holds with
-        # different values starts a rewind: local rows from that step on are
-        # dropped and the pod's rows win (newest values per step).
-        local_rows = None
-        rewind_from = None
+        pod_rows = []
         for ln in m.get("text", "").splitlines():
             try:
-                row = json.loads(ln)
+                pod_rows.append(self.scrub.obj(json.loads(ln)))
             except ValueError:
                 continue
-            step = row.get("step")
-            if isinstance(step, (int, float)) and last is not None and step <= last and rewind_from is None:
-                if local_rows is None:
-                    local_rows = {r.get("step"): r for r in read_jsonl(self.paths.d("metrics.jsonl"))}
-                old = local_rows.get(step)
-                if old is None or old == self.scrub.obj(row):
-                    continue  # already copied
-                rewind_from = step
-            rows.append(self.scrub.obj(row))
-            if isinstance(step, (int, float)):
-                last = step
-        if rewind_from is not None:
-            kept = [r for r in read_jsonl(self.paths.d("metrics.jsonl"))
-                    if not (isinstance(r.get("step"), (int, float)) and r["step"] >= rewind_from)]
-            atomic_write_text(self.paths.d("metrics.jsonl"),
-                              "".join(json.dumps(r) + "\n" for r in kept + rows))
-            self.mon.event("note", f"GRPO resumed: replaced metric rows from step {rewind_from} on.")
+        rewritten = bool(m.get("reset")) or bool(c.get("reread")) or int(c.get("metrics_offset") or 0) > int(m.get("size") or 0)
+        path = self.paths.d("metrics.jsonl")
+        if rewritten and m.get("start", 0) == 0:
+            local = read_jsonl(path)
+            k = 0
+            while k < len(local) and k < len(pod_rows) and local[k] == pod_rows[k]:
+                k += 1
+            if k < len(local):
+                lost = local[k].get("step")
+                atomic_write_text(path, "".join(json.dumps(r) + "\n" for r in local[:k] + pod_rows[k:]))
+                self.mon.event("note", f"GRPO resumed: replaced metric rows from step {lost} on.")
+            else:
+                append_jsonl_atomic(path, pod_rows[k:])
         else:
-            append_jsonl_atomic(self.paths.d("metrics.jsonl"), rows)
+            append_jsonl_atomic(path, pod_rows)
+        steps = [r["step"] for r in read_jsonl(path) if isinstance(r.get("step"), (int, float))]
         c["metrics_offset"] = m["end"]
-        c["last_step"] = last
+        c["last_step"] = max(steps) if steps else None
 
     def log_tail(self, text) -> None:
         if text is None:
@@ -184,7 +184,7 @@ class Collector:
         missing = [n for n in want if n not in have]
         if missing:
             with tempfile.TemporaryDirectory(dir=self.paths.cache) as td:
-                r = conn.pipe_to("tar -C results/run3/samples -cf - " + " ".join(missing), ["tar", "-xf", "-", "-C", td], timeout=300)
+                r = conn.pipe_to(f"tar -C {self.paths.names.samples} -cf - " + " ".join(missing), ["tar", "-xf", "-", "-C", td], timeout=300)
                 if r.ok:
                     for n in missing:
                         src = Path(td) / n
@@ -271,7 +271,7 @@ class NoteWriter:
         self.mon = mon
         self.clock = clock
         self.runner = runner or self._run_claude
-        self.prompt = (HERE / "prompt.md").read_text(encoding="utf-8")
+        self.prompt = (HERE / "prompt.md").read_text(encoding="utf-8").replace("{run_label}", mon.paths.names.label)
 
     def context(self) -> str:
         d = self.mon.paths.data

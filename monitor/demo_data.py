@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Write a demo ~/cua-run3/data/ set from run-2 results, for dashboard development.
+"""Write a demo data/ set from run-2 results, for dashboard development.
 
 Every file this script writes is demo data: data/state.json carries
 `"demo": true`, and data/.demo lists the files it wrote. The real collector
 deletes them all when a real run starts.
 
 Usage:
-  python3 monitor/demo_data.py --src results/run2 [--data ~/cua-run3/data] [--progress 0.75]
+  python3 monitor/demo_data.py --src results/run2 [--data ~/cua-run4/data] [--progress 0.75]
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def gif_to_jpgs(gif: Path, outdir: Path, max_turns: int) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--src", required=True, help="run-2 results folder (results/run2)")
-    ap.add_argument("--data", default=None, help="output folder (default: ~/cua-run3/data)")
+    ap.add_argument("--data", default=None, help="output folder (default: the data folder of the selected run, ~/cua-run4/data)")
     ap.add_argument("--progress", type=float, default=0.75, help="fraction of GRPO done in the demo")
     ap.add_argument("--samples", type=int, default=14)
     args = ap.parse_args()

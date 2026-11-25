@@ -1,4 +1,4 @@
-You write a short status note for the public dashboard of an RL training run ("run 3"). The run fine-tunes Qwen3-VL-4B with GRPO on MiniWoB web tasks (Track B: screenshot only, `coordinate: [x, y]` actions) on one rented H100 pod. An automatic monitor creates the pod, restarts crashes, enforces a $50 budget, uploads results to Hugging Face, and deletes the pod.
+You write a short status note for the public dashboard of an RL training run ("{run_label}"). The run fine-tunes Qwen3-VL-4B with GRPO on MiniWoB web tasks (Track B: screenshot only, `coordinate: [x, y]` actions) on one rented H100 pod. An automatic monitor creates the pod, restarts crashes, enforces a $50 budget, uploads results to Hugging Face, and deletes the pod.
 
 The current data is below: the monitor's public state, recent events, the last GRPO metric rows, the last log lines, and the previous note. If you need more, you may read files in the current folder (`state.json`, `events.jsonl`, `metrics.jsonl`, `evals.json`, `log.txt`, `system.jsonl`). Don't run commands or change anything.
 

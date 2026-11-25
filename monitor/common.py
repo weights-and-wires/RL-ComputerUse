@@ -1,4 +1,4 @@
-"""Shared helpers for the run-3 monitor: paths, atomic writes, scrubbing, evals.
+"""Shared helpers for the run monitor: paths, atomic writes, scrubbing, evals.
 
 Standard library only, so the monitor runs on the system Python on Bazzite and
 the tests run with plain `python3` on macOS.
@@ -20,11 +20,72 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 
-class Paths:
-    """Every file the monitor reads or writes, rooted at CUA_RUN3_HOME."""
+def infer_run(install_dir: str | os.PathLike | None = None) -> tuple[str, Path | None]:
+    """Work out the run name and home from where the monitor code is installed.
 
-    def __init__(self, home: str | os.PathLike | None = None):
-        self.home = Path(home or os.environ.get("CUA_RUN3_HOME") or Path.home() / "cua-run3")
+    Code at `~/cua-run3/monitor/` belongs to run 3 and uses `~/cua-run3` as its
+    home. Code anywhere else (for example your checkout) returns no home.
+    """
+    here = Path(install_dir or Path(os.path.abspath(__file__)).parent)  # abspath, not resolve: keep ~ spelling
+    m = re.fullmatch(r"cua-(run\d+[a-z]?)", here.parent.name)
+    if here.name == "monitor" and m:
+        return m.group(1), here.parent
+    return DEFAULT_RUN, None
+
+
+DEFAULT_RUN = "run4"
+
+
+class RunNames:
+    """Every name that depends on the run, derived from the one setting `run`.
+
+    The pod side uses the same pattern for each run: `scripts/<run>.sh`,
+    `scripts/<run>_pod_start.sh`, `scripts/upload_<run>.py`, tmux sessions
+    `<run>` and `<run>-sync`, and `results/<run>/`.
+    """
+
+    def __init__(self, run: str = DEFAULT_RUN):
+        if not re.fullmatch(r"run\d+[a-z]?", run):
+            raise ValueError(f"run name {run!r} must look like run4")
+        self.run = run
+        m = re.fullmatch(r"run(\d+)([a-z]?)", run)
+        self.label = f"Run {m.group(1)}{m.group(2)}"
+        self.results = f"results/{run}"
+        self.metrics = f"{self.results}/train/grpo-4b-{run}/metrics.jsonl"
+        self.stop_flag = f"{self.results}/.stop_grpo"
+        self.samples = f"{self.results}/samples"
+        self.run_sh = f"scripts/{run}.sh"
+        self.pod_start = f"scripts/{run}_pod_start.sh"
+        self.upload = f"scripts/upload_{run}.py"
+        self.tmux = run
+        self.tmux_sync = f"{run}-sync"
+        self.unit = f"cua-{run}-monitor"
+        self.home_name = f"cua-{run}"
+        self.hf_ckpt = f"checkpoints/grpo-4b-{run}"
+        self.hf_results = f"results/{run}"
+
+    def required_repo_files(self) -> list[str]:
+        return [self.pod_start, self.run_sh, self.upload]
+
+    def pod_name(self, started_ts: float, gen: int) -> str:
+        return f"cua-{self.run}-{int(started_ts or 0)}-g{gen}"
+
+
+class Paths:
+    """Every file the monitor reads or writes, rooted at the run's home folder.
+
+    Order of precedence for the run name: the `run` argument, `CUA_RUN`, the
+    install folder (`~/cua-run3/monitor` means run 3), then `run4`. The home is
+    the `home` argument, `CUA_RUN_HOME`, the install folder's parent, then
+    `~/cua-<run>`.
+    """
+
+    def __init__(self, home: str | os.PathLike | None = None, run: str | None = None):
+        inferred_run, inferred_home = infer_run()
+        self.run = run or os.environ.get("CUA_RUN") or inferred_run
+        self.names = RunNames(self.run)
+        default_home = inferred_home if (inferred_home and self.run == inferred_run) else Path.home() / self.names.home_name
+        self.home = Path(home or os.environ.get("CUA_RUN_HOME") or default_home)
         self.env = self.home / ".env"
         self.repo = self.home / "repo"
         self.state = self.home / "state.json"

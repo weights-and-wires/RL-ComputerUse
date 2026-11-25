@@ -32,10 +32,11 @@ class FakeClock:
 
 
 class FakePod:
-    """Simulates the pod-side contract: run3_pod_start.sh, run3.sh --status-json, upload."""
+    """Simulates the pod-side contract: <run>_pod_start.sh, <run>.sh --status-json, upload."""
 
-    def __init__(self, pod_id: str):
+    def __init__(self, pod_id: str, run: str = "run4"):
         self.id = pod_id
+        self.run = run
         self.reachable = True
         self.tmux = False
         self.started = 0
@@ -84,7 +85,7 @@ class FakePod:
             phases.append({"name": p, "status": s, "started": "2027-01-15T08:00:00Z" if s != "pending" else None,
                            "finished": None})
         return {
-            "run": "run3", "done": self.done, "all_done_line": self.done, "running": self.tmux,
+            "run": self.run, "done": self.done, "all_done_line": self.done, "running": self.tmux,
             "current_phase": None if self.done else PHASES[self.phase_idx], "failed_phase": self.failed_phase,
             "phases": phases,
             "grpo": {"step": self.grpo_step, "max_steps": 400, "last_checkpoint": self.grpo_step // 25 * 25,
@@ -98,7 +99,8 @@ class FakePod:
         start = offset if offset <= len(b) else 0
         return {
             "status": self.status(),
-            "metrics": {"size": len(b), "start": start, "end": len(b), "text": b[start:].decode()},
+            "metrics": {"size": len(b), "start": start, "end": len(b), "reset": offset > 0 and start == 0,
+                        "text": b[start:].decode()},
             "log_tail": self.log,
             "evals": self.evals,
             "samples": self.samples,
@@ -129,7 +131,8 @@ class FakeConn:
         if ".secrets" in cmd:
             pod.secrets = stdin or b""
             return Result(0, "", "")
-        if "run3_pod_start.sh" in cmd:
+        run = self.world.run
+        if f"{run}_pod_start.sh" in cmd:
             if pod.start_fail:
                 return Result(1, "bootstrap failed\n", "pip error")
             if pod.tmux:
@@ -137,12 +140,12 @@ class FakeConn:
             pod.tmux, pod.failed_phase = True, None
             pod.started += 1
             return Result(0, "restoring...\nSTARTED\n", "")
-        if "run3.sh --status-json" in cmd:
+        if f"scripts/{run}.sh --status-json" in cmd:
             return Result(0, json.dumps(pod.status()) + "\n", "")
-        if ".stop_grpo" in cmd:
+        if f"{run}/.stop_grpo" in cmd:
             pod.stop_grpo = True
             return Result(0, "", "")
-        if "upload_run3.py" in cmd:
+        if f"upload_{run}.py" in cmd:
             pod.uploads += 1
             return Result(0, "UPLOAD VERIFIED\n", "") if pod.upload_ok else Result(1, "", "missing_on_hub=3")
         if "python3 -" in cmd:
@@ -176,8 +179,11 @@ class FakeConn:
 class FakeWorld:
     """The fake Runpod account: pods, stock, and the SSH side of each pod."""
 
-    def __init__(self, clock: FakeClock):
+    def __init__(self, clock: FakeClock, run: str = "run4"):
         self.clock = clock
+        self.run = run
+        self.balance: float | None = 100.0   # None makes the balance query fail
+        self.attempts: list[tuple[str, str]] = []   # every (gpu, cloud) create_pod saw, in order
         self.api_pods: dict[str, dict] = {}
         self.pods: dict[str, FakePod] = {}
         self.no_stock: set[tuple[str, str]] = set()
@@ -208,6 +214,7 @@ class FakeWorld:
     def create_pod(self, body):
         self._check()
         gpu, cloud = body["gpu"]["id"], body["cloud"]
+        self.attempts.append((gpu, cloud))
         if (gpu, cloud) in self.no_stock:
             raise ApiError(400, "this GPU and data center combination could not be placed")
         assert body["disk"] >= 100 and "PUBLIC_KEY" in body["env"] and "mounts" not in body
@@ -220,7 +227,7 @@ class FakeWorld:
             "ssh": {"direct": {"host": f"10.0.0.{len(self.api_pods)}", "port": 22000 + len(self.api_pods)}},
             "createdAt": "2027-01-15T08:00:00Z", "startedAt": "2027-01-15T08:00:30Z",
         }
-        self.pods[pid] = FakePod(pid)
+        self.pods[pid] = FakePod(pid, self.run)
         return json.loads(json.dumps(self.api_pods[pid]))
 
     def delete_pod(self, pod_id):
@@ -234,6 +241,10 @@ class FakeWorld:
 
     def gpu_prices(self):
         return {}
+
+    def client_balance(self):
+        self._check()
+        return self.balance
 
     # --- scenario helpers -------------------------------------------------------------
     def conn(self, host, port):
@@ -250,26 +261,27 @@ class FakeWorld:
             self.api_pods[pod_id]["status"] = how
 
 
-def make_home(tmp: Path, armed: bool = True) -> Paths:
-    paths = Paths(tmp)
+def make_home(tmp: Path, armed: bool = True, run: str = "run4") -> Paths:
+    paths = Paths(tmp, run)
     paths.data.mkdir(parents=True, exist_ok=True)
     paths.cache.mkdir(parents=True, exist_ok=True)
     (paths.repo / "scripts").mkdir(parents=True, exist_ok=True)
-    (paths.repo / "scripts" / "run3_pod_start.sh").write_text("#!/bin/bash\n")
+    for f in paths.names.required_repo_files():
+        (paths.repo / f).write_text("#!/bin/bash\n")
     paths.env.write_text("RUNPOD_API_KEY=rpa_FAKEFAKEFAKEFAKEFAKEFAKE\nHF_TOKEN=hf_FAKEFAKEFAKEFAKEFAKEFAKE\n"
-                         "WANDB_API_KEY=0123456789abcdef0123456789abcdef01234567\nHF_ADAPTER_REPO=someone/qwen-run3\n")
+                         "WANDB_API_KEY=0123456789abcdef0123456789abcdef01234567\nHF_ADAPTER_REPO=someone/qwen-run4\n")
     paths.extra_keys.write_text("ssh-ed25519 AAAAfakeMacKey mac\n")
     if armed:
         atomic_write_json(paths.armed, {"t": "now"})
     return paths
 
 
-def build(tmp: Path, armed: bool = True, config: dict | None = None):
+def build(tmp: Path, armed: bool = True, config: dict | None = None, run: str = "run4"):
     from common import load_env
     from monitor import DEFAULT_CONFIG, Monitor
     clock = FakeClock()
-    world = FakeWorld(clock)
-    paths = make_home(tmp, armed)
+    world = FakeWorld(clock, run)
+    paths = make_home(tmp, armed, run)
     cfg = dict(DEFAULT_CONFIG, ssh_key=str(tmp / "nokey"), **(config or {}))
     out = io.StringIO()
     mon = Monitor(paths, world, world.conn, clock=clock, config=cfg, env=load_env(paths.env), out=out,
@@ -289,8 +301,7 @@ def events(paths: Paths) -> list[str]:
 def scenario_full(tmp: Path, say=print):
     """create -> running -> crash -> restart -> pod lost -> recreate -> soft stop -> done -> upload -> delete."""
     mon, world, clock, paths, out = build(tmp)
-    world.no_stock.add(("NVIDIA H100 80GB HBM3", "COMMUNITY"))  # forces the fallbacks
-    world.no_stock.add(("NVIDIA H100 80GB HBM3", "SECURE"))
+    world.no_stock.add(("NVIDIA H100 80GB HBM3", "COMMUNITY"))  # forces the next Community type (PCIe)
 
     def tick(label, dt=120):
         clock.advance(dt)
@@ -299,7 +310,7 @@ def scenario_full(tmp: Path, say=print):
             f"gen={mon.st['generation']} restarts={mon.st['restarts']}")
 
     tick("tick 1: armed, idle")
-    tick("tick 2: create pod (SXM out of stock on both clouds)")
+    tick("tick 2: create pod (Community SXM out of stock)")
     p1 = mon.st["current_pod"]
     tick("tick 3: bootstrap (ssh, secrets, code, start)")
     pod = world.pods[p1]
@@ -344,6 +355,38 @@ def scenario_hard_budget(tmp: Path, say=print):
     return mon, world, paths, pod
 
 
+def scenario_secure_fallback(tmp: Path, say=print):
+    """Community is empty: retry SXM, PCIe, NVL for 20 min, then Secure in the order SXM, PCIe, NVL."""
+    mon, world, clock, paths, out = build(tmp)
+    types = mon.cfg["gpu_types"]
+    for g in types:
+        world.no_stock.add((g, "COMMUNITY"))
+    world.no_stock.add((types[0], "SECURE"))  # Secure SXM is out too, so Secure PCIe wins
+    clock.advance(1)
+    mon.tick()  # idle -> creating_pod
+    mon.tick()  # the first create try starts the Community window
+    while clock() - mon.st["create_since"] < mon.cfg["community_wait_s"] - 20:
+        clock.advance(20)
+        mon.tick()
+    before = list(world.attempts)
+    say(f"  {len(before)} Community tries, no Secure try yet, state={mon.st['run_state']}")
+    clock.advance(40)
+    mon.tick()  # past the window: Secure
+    say(f"  after the window: state={mon.st['run_state']} pod on {mon.pod_rec() and mon.pod_rec()['gpu']}/"
+        f"{mon.pod_rec() and mon.pod_rec()['cloud']}")
+    return mon, world, paths, before
+
+
+def scenario_low_balance(tmp: Path, say=print):
+    mon, world, clock, paths, out = build(tmp)
+    world.balance = 20.0  # needs 48 - 0 + 2 = 50
+    clock.advance(1)
+    mon.tick()
+    mon.tick()
+    say(f"  balance $20: state={mon.st['run_state']} creates={world.creates}")
+    return mon, world, paths
+
+
 def run_dry_scenario(verbose=True) -> int:
     say = print if verbose else (lambda *a: None)
     ok = True
@@ -354,7 +397,9 @@ def run_dry_scenario(verbose=True) -> int:
         say("  events: " + ", ".join(ev))
         checks = {
             "two pods created": world.creates == 2,
-            "fallback GPU recorded": mon.pod_rec(p1)["gpu"] == "NVIDIA H100 PCIe",
+            "fallback GPU recorded": mon.pod_rec(p1)["gpu"] == "NVIDIA H100 PCIe"
+                                     and mon.pod_rec(p1)["cloud"] == "COMMUNITY",
+            "gpu_fallback event": "gpu_fallback" in ev,
             "one restart": mon.st["restarts"] == 1,
             "pod_lost + pod_recreated": "pod_lost" in ev and "pod_recreated" in ev,
             "budget_soft_stop once": ev.count("budget_soft_stop") == 1 and world.pods[p2].stop_grpo,
@@ -375,6 +420,32 @@ def run_dry_scenario(verbose=True) -> int:
             "hard stop teardown": mon.st["teardown_reason"] == "hard_budget",
             "uploaded then deleted": pod.uploads == 1 and world.deletes == [pod.id],
             "state failed (run cut short)": mon.st["run_state"] == "failed",
+        }
+        for k, v in checks.items():
+            say(f"  [{'ok' if v else 'FAIL'}] {k}")
+            ok &= v
+        say("Scenario 3: Community for 20 min, then Secure (SXM, PCIe, NVL)")
+        mon, world, paths, before = scenario_secure_fallback(Path(td) / "c", say)
+        ev = events(paths)
+        rec = mon.pod_rec()
+        checks = {
+            "only Community before the window": bool(before) and all(c == "COMMUNITY" for _, c in before),
+            "Community order SXM, PCIe, NVL": [g for g, _ in before[:3]] == mon.cfg["gpu_types"],
+            "Secure SXM tried before Secure PCIe": [a for a in world.attempts if a[1] == "SECURE"][:2]
+                                                    == [(mon.cfg["gpu_types"][0], "SECURE"), (mon.cfg["gpu_types"][1], "SECURE")],
+            "pod on Secure PCIe": (rec["gpu"], rec["cloud"]) == ("NVIDIA H100 PCIe", "SECURE"),
+            "fallback events": ev.count("gpu_fallback") >= 3,
+        }
+        for k, v in checks.items():
+            say(f"  [{'ok' if v else 'FAIL'}] {k}")
+            ok &= v
+        say("Scenario 4: low Runpod balance refuses to create a pod")
+        mon, world, paths = scenario_low_balance(Path(td) / "d", say)
+        checks = {
+            "no pod created": world.creates == 0 and not world.attempts,
+            "state failed": mon.st["run_state"] == "failed",
+            "loud error event": "error" in events(paths),
+            "ARMED removed": not paths.armed.exists(),
         }
         for k, v in checks.items():
             say(f"  [{'ok' if v else 'FAIL'}] {k}")

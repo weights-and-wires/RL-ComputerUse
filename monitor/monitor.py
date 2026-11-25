@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Run-3 monitor: creates and watches the Runpod pod, enforces the budget, tears down.
+"""Run monitor: creates and watches the Runpod pod, enforces the budget, tears down.
 
-Runs on Bazzite as the user systemd unit `cua-run3-monitor`. The state lives in
-~/cua-run3/state.json and survives restarts of this process. See README.md.
+Runs on Bazzite as the user systemd unit `cua-<run>-monitor` (for example
+`cua-run4-monitor`). The state lives in ~/cua-<run>/state.json and survives
+restarts of this process. Every pod path, script name, tmux name, and label
+derives from the one setting `run` (default run4). See README.md.
 
 Usage:
   monitor.py run            Main loop (what the systemd unit runs).
@@ -11,6 +13,9 @@ Usage:
   monitor.py plan           Print the pod plan and live prices (read-only API calls).
   monitor.py stop|kill      Queue a graceful stop or an immediate teardown.
   monitor.py --dry-run      Run the built-in scenario against a fake pod and API.
+
+Select the run with --run, the CUA_RUN environment variable, or by installing the
+code under ~/cua-<run>/monitor (the monitor reads the run name from that folder).
 """
 
 from __future__ import annotations
@@ -53,7 +58,10 @@ DEFAULT_CONFIG = {
     "bootstrap_timeout_s": 1500,
     "max_generations": 4,
     "max_phase_failures": 3,
-    "max_create_attempts": 30,
+    "max_create_attempts": 120,  # one try every 20 s: 20 min of Community, then Secure
+    "community_wait_s": 1200,    # keep retrying Community this long before falling back to Secure
+    "balance_margin_usd": 2.0,   # refuse to create a pod below (hard stop - spend) + this
+    "balance_check_attempts": 5,
     "upload_attempts": 2,
     "upload_timeout_s": 5400,
     "start_timeout_s": 2400,
@@ -62,18 +70,12 @@ DEFAULT_CONFIG = {
     "min_vcpu_per_gpu": 16,
     "min_ram_per_gpu": 64,
     "start_ssh": True,
-    # Tried in order until one has stock.
-    "gpu_candidates": [
-        # Community first: about $2.69/hr against $4.39/hr on Secure (2026-11-24),
-        # which is what lets the plan's 12 h fit the $50 cap. A lost community
-        # pod is recreated and resumes from the last synced checkpoint.
-        ["NVIDIA H100 80GB HBM3", "COMMUNITY"],
-        ["NVIDIA H100 80GB HBM3", "SECURE"],
-        ["NVIDIA H100 PCIe", "COMMUNITY"],
-        ["NVIDIA H100 NVL", "COMMUNITY"],
-        ["NVIDIA H100 PCIe", "SECURE"],
-        ["NVIDIA H100 NVL", "SECURE"],
-    ],
+    "run": "run4",
+    # GPU policy: Community first, in this order of types, retried for community_wait_s;
+    # then Secure in the same order. Community costs about $2.69/hr against $4.39/hr
+    # on Secure (2026-11-24). A lost Community pod is recreated and resumes from the
+    # last synced checkpoint.
+    "gpu_types": ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe", "NVIDIA H100 NVL"],  # SXM, PCIe, NVL
     # Used for spend until the API reports the pod's own hourly rate.
     "fallback_cost_per_hr": 4.50,
     "ssh_key": "~/.ssh/id_ed25519",
@@ -86,6 +88,7 @@ TERMINAL = {"done", "failed"}
 def load_config(paths: Paths) -> dict:
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(read_json(paths.home / "config.json", default={}) or {})
+    cfg["run"] = paths.run  # the run is fixed by --run, CUA_RUN, or the install folder
     return cfg
 
 
@@ -116,9 +119,18 @@ def new_state() -> dict:
         "last_status_ts": None,
         "last_error": None,
         "adopt_id": None,
+        "create_since": None,   # when this generation's pod creation began
+        "gpu_noted": [],        # fallbacks already announced for this generation
+        "balance_fails": 0,
         "wandb_url": None,
         "eta": None,
     }
+
+
+def gpu_short(gpu_id: str) -> str:
+    """H100 variant name for messages: SXM, PCIe, or NVL."""
+    g = (gpu_id or "").upper()
+    return "SXM" if "HBM3" in g or "SXM" in g else "PCIe" if "PCIE" in g else "NVL" if "NVL" in g else gpu_id
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +142,7 @@ class Monitor:
     def __init__(self, paths: Paths, api, pod_factory, clock=time.time, config: dict | None = None,
                  env: dict | None = None, out=None, local_tar_argv=None):
         self.paths = paths
+        self.n = paths.names  # every run-dependent name
         self.api = api
         self.pod_factory = pod_factory
         self.clock = clock
@@ -235,6 +248,8 @@ class Monitor:
         hf_repo = self.env.get("HF_ADAPTER_REPO")
         spend = self.refresh_spend()
         pub = {
+            "run": self.n.run,
+            "run_label": self.n.label,
             "demo": False,
             "run_state": st["run_state"],
             "updated": now_iso(self.clock()),
@@ -261,10 +276,11 @@ class Monitor:
             "gpu": status.get("gpu"),
             "teardown_reason": st.get("teardown_reason"),
             "soft_stop_sent": st.get("soft_stop_sent"),
+            "gpu_policy": {"community_wait_s": self.cfg["community_wait_s"]},
         }
         atomic_write_json(self.paths.d("state.json"), self.scrub.obj(pub))
 
-    # --- commands from run3_go.sh ---------------------------------------------------
+    # --- commands from the trigger script ---------------------------------------------------
 
     def armed(self) -> dict | None:
         if not self.paths.armed.exists():
@@ -362,10 +378,10 @@ class Monitor:
         conn = self.pod_conn()
         if not conn:
             return False
-        r = conn.run("mkdir -p results/run3 && touch results/run3/.stop_grpo", timeout=60)
+        r = conn.run(f"mkdir -p {self.n.results} && touch {self.n.stop_flag}", timeout=60)
         if r.ok:
             self.st["soft_stop_sent"] = True
-            self.event(kind, f"{why} Touched results/run3/.stop_grpo: GRPO saves and ends at the next step, then post-training evals run.")
+            self.event(kind, f"{why} Touched {self.n.stop_flag}: GRPO saves and ends at the next step, then post-training evals run.")
             return True
         self.log(f"soft stop failed (rc {r.rc}); will retry: {r.err[-200:]}")
         return False
@@ -376,11 +392,18 @@ class Monitor:
         arm = self.armed()
         if arm is None:
             return
+        missing = [f for f in self.n.required_repo_files() if not (self.paths.repo / f).is_file()]
+        if missing:
+            self.reset_for_new_run()
+            self.error(f"Not arming {self.n.label}: {', '.join(missing)} missing from {self.paths.repo}. "
+                       f"Sync the repo with the trigger script, then arm again.")
+            self.finish("failed", "pod-side files missing from the repo; no pod was created")
+            return
         self.reset_for_new_run()
         self.st["started_ts"] = self.clock()
         self.st["adopt_id"] = arm.get("adopt")
         self.clear_demo_data()
-        self.event("note", "Monitor armed. Run 3 starting." + (f" Adopting pod {arm['adopt']}." if arm.get("adopt") else ""))
+        self.event("note", f"Monitor armed. {self.n.label} starting." + (f" Adopting pod {arm['adopt']}." if arm.get("adopt") else ""))
         self.set_state("creating_pod", "armed")
 
     def reset_for_new_run(self) -> None:
@@ -427,7 +450,7 @@ class Monitor:
     # --- creating_pod ---------------------------------------------------------------
 
     def pod_name(self, gen: int) -> str:
-        return f"cua-run3-{int(self.st['started_ts'] or 0)}-g{gen}"
+        return self.n.pod_name(self.st["started_ts"], gen)
 
     def public_keys(self) -> str:
         keys = []
@@ -474,6 +497,7 @@ class Monitor:
         self.st["current_pod"] = rec["id"]
         self.st["generation"] = gen
         self.st["ssh_fail_since"] = None
+        self.st["create_since"], self.st["gpu_noted"], self.st["balance_fails"] = None, [], 0
         return rec
 
     def on_creating_pod(self) -> None:
@@ -516,9 +540,20 @@ class Monitor:
         except ApiError as e:
             self.log(f"list_pods failed: {e}")
 
+        if not self.balance_ok():
+            return
+
+        now = self.clock()
+        if self.st.get("create_since") is None:
+            self.st["create_since"] = now
+        elapsed = now - self.st["create_since"]
+        plan = self.gpu_plan(elapsed)
+        if elapsed >= self.cfg["community_wait_s"]:
+            self.note_once("secure_phase", f"No Community H100 stock after {int(elapsed // 60)} min. Falling back to "
+                                           f"Secure Cloud in the order {', '.join(gpu_short(g) for g in self.cfg['gpu_types'])}.")
         self.st["create_attempts"] += 1
         tried = []
-        for gpu, cloud in self.cfg["gpu_candidates"]:
+        for i, (gpu, cloud) in enumerate(plan):
             start_ssh = bool(self.cfg.get("start_ssh", True))
             for _ in range(2):
                 try:
@@ -529,11 +564,15 @@ class Monitor:
                         continue
                     tried.append(f"{gpu}/{cloud}: {e}")
                     if e.status in (401, 403):
-                        self.error(f"Runpod refused the API key ({e}). Fix RUNPOD_API_KEY in ~/cua-run3/.env.")
+                        self.error(f"Runpod refused the API key ({e}). Fix RUNPOD_API_KEY in {self.paths.env}.")
                         return
                     if e.status == 0 or e.status == 429 or e.status >= 500:
                         self.log(f"create_pod transient error: {e}; retrying next tick")
                         return
+                    nxt = (f"{gpu_short(plan[i + 1][0])} on {plan[i + 1][1].title()}" if i + 1 < len(plan)
+                           else "the same list again in a few seconds")
+                    self.note_once(f"{gpu}/{cloud}", f"No stock for {gpu_short(gpu)} on {cloud.title()} ({e.detail[:100]}). "
+                                                     f"Trying {nxt}.")
                     break
                 if not raw or not raw.get("id"):
                     tried.append(f"{gpu}/{cloud}: no pod id in response")
@@ -541,7 +580,8 @@ class Monitor:
                 rec = self.record_pod(raw, gen, adopted=False, gpu=gpu, cloud=cloud)
                 self.st["create_attempts"] = 0
                 kind = "pod_created" if gen == 1 else "pod_recreated"
-                fallback = "" if (gpu, cloud) == tuple(self.cfg["gpu_candidates"][0]) else " (fallback choice)"
+                first = (self.cfg["gpu_types"][0], "COMMUNITY")
+                fallback = "" if (gpu, cloud) == first else f" (fallback from Community {gpu_short(first[0])})"
                 self.event(kind, f"Created pod {rec['id']} on {gpu} / {cloud}{fallback}, "
                                  f"${rec['cost_per_hr'] or '?'}/hr, generation {gen}.")
                 self.set_state("bootstrapping", "pod created")
@@ -549,6 +589,55 @@ class Monitor:
         self.error(f"No H100 stock for any candidate (attempt {self.st['create_attempts']}): " + " | ".join(tried), loud=self.st["create_attempts"] % 5 == 1)
         if self.st["create_attempts"] >= self.cfg["max_create_attempts"]:
             self.finish("failed", "could not create a pod")
+
+    def gpu_plan(self, elapsed: float) -> list[tuple[str, str]]:
+        """Community (SXM, PCIe, NVL) for `community_wait_s`, then Secure in that order.
+
+        After the wait, Community stays on the list behind Secure as a last resort.
+        """
+        types = self.cfg["gpu_types"]
+        community = [(g, "COMMUNITY") for g in types]
+        secure = [(g, "SECURE") for g in types]
+        return community if elapsed < self.cfg["community_wait_s"] else secure + community
+
+    def note_once(self, key: str, msg: str) -> None:
+        """Record a gpu_fallback event once per pod generation."""
+        noted = self.st.setdefault("gpu_noted", [])
+        if key in noted:
+            return
+        noted.append(key)
+        self.event("gpu_fallback", msg)
+
+    def balance_ok(self) -> bool:
+        """Refuse to create a pod when the account can't cover the rest of the budget.
+
+        Needs balance >= (hard stop - spend so far) + margin. A failed query is
+        retried on the next ticks, and after `balance_check_attempts` failures in a
+        row the run fails instead of creating a pod it can't check.
+        """
+        try:
+            balance = self.api.client_balance()
+        except ApiError:
+            balance = None
+        if balance is None:
+            self.st["balance_fails"] = self.st.get("balance_fails", 0) + 1
+            self.log(f"balance check failed ({self.st['balance_fails']}/{self.cfg['balance_check_attempts']}); not creating a pod yet")
+            if self.st["balance_fails"] >= self.cfg["balance_check_attempts"]:
+                self.error("Can't read the Runpod account balance, so the monitor won't create a pod. "
+                           "Check RUNPOD_API_KEY and the Runpod status page.")
+                self.finish("failed", "balance check unavailable")
+            return False
+        self.st["balance_fails"] = 0
+        spent = self.spend()
+        need = max(0.0, self.cfg["hard_stop_usd"] - spent) + self.cfg["balance_margin_usd"]
+        if balance < need:
+            self.error(f"Runpod balance ${balance:.2f} is below the ${need:.2f} needed "
+                       f"(${self.cfg['hard_stop_usd']:.0f} hard stop - ${spent:.2f} spent + ${self.cfg['balance_margin_usd']:.0f} margin). "
+                       "Not creating a pod. Add credit, then arm the run again.")
+            self.finish("failed", "insufficient Runpod balance")
+            return False
+        self.log(f"balance check ok: ${balance:.2f} >= ${need:.2f}")
+        return True
 
     # --- bootstrapping ---------------------------------------------------------------
 
@@ -614,7 +703,7 @@ class Monitor:
                 lines.append(f"export {k}={shlex.quote(v)}\n")
         missing = [k for k in ("HF_TOKEN", "WANDB_API_KEY", "HF_ADAPTER_REPO") if not self.env.get(k)]
         if missing:
-            self.log(f"warning: {', '.join(missing)} missing from ~/cua-run3/.env")
+            self.log(f"warning: {', '.join(missing)} missing from {self.paths.env}")
         r = conn.run("umask 077; mkdir -p /workspace && cat > /workspace/.secrets.tmp && "
                      "chmod 600 /workspace/.secrets.tmp && mv /workspace/.secrets.tmp /workspace/.secrets",
                      stdin="".join(lines).encode(), timeout=60, in_repo=False)
@@ -632,26 +721,30 @@ class Monitor:
         return ["tar", "-C", str(self.paths.repo), *ex, "-czf", "-", "."]
 
     def ship_code(self, conn) -> bool:
-        if not (self.paths.repo / "scripts" / "run3_pod_start.sh").exists() and not self.local_tar_argv:
-            self.error(f"{self.paths.repo}/scripts/run3_pod_start.sh is missing. Sync the repo with run3_go.sh.")
+        if not (self.paths.repo / self.n.pod_start).exists() and not self.local_tar_argv:
+            self.error(f"{self.paths.repo}/{self.n.pod_start} is missing. Sync the repo with the trigger script.")
             return False
         r = conn.pipe_from(self.tar_argv(), f"mkdir -p {REMOTE_REPO} && tar -xzf - -C {REMOTE_REPO}", timeout=900)
         if not r.ok:
             self.error(f"shipping code failed (rc {r.rc}): {r.err[-300:]}", loud=False)
             return False
-        self.event("note", f"Shipped the code from ~/cua-run3/repo to {REMOTE_REPO}.")
+        self.event("note", f"Shipped the code from {self.paths.repo} to {REMOTE_REPO}.")
         return True
 
     def start_run(self, conn, why: str) -> bool:
-        r = conn.run("bash scripts/run3_pod_start.sh", timeout=self.cfg["start_timeout_s"])
+        # The pod's own price sets run4.sh's spend log and BASE_EVAL=auto (the
+        # full base-model suite runs only at $3.00/h or less).
+        rate = (self.pod_rec() or {}).get("cost_per_hr")
+        env = f"PRICE_PER_HR={float(rate):.2f} " if isinstance(rate, (int, float)) and rate > 0 else ""
+        r = conn.run(f"{env}bash {self.n.pod_start}", timeout=self.cfg["start_timeout_s"])
         text = (r.out or "")[-2000:]
         if r.ok and ("STARTED" in text or "ALREADY_RUNNING" in text):
             word = "ALREADY_RUNNING" if "ALREADY_RUNNING" in text else "STARTED"
             if why == "bootstrap":
-                self.event("note", f"run3_pod_start.sh printed {word}. The pipeline is running.")
+                self.event("note", f"{Path(self.n.pod_start).name} printed {word}. The pipeline is running.")
             self.set_state("stopping" if self.st.get("stop_requested") else "running", why)
             return True
-        msg = f"run3_pod_start.sh failed (rc {r.rc}): {(r.err or text)[-400:]}"
+        msg = f"{Path(self.n.pod_start).name} failed (rc {r.rc}): {(r.err or text)[-400:]}"
         if why == "bootstrap":
             self.note_failure("pod_start", None)
             if self.st["fail_count"] >= self.cfg["max_phase_failures"]:
@@ -664,7 +757,7 @@ class Monitor:
     # --- running ---------------------------------------------------------------------
 
     def status_json(self, conn):
-        r = conn.run("bash scripts/run3.sh --status-json", timeout=60)
+        r = conn.run(f"bash {self.n.run_sh} --status-json", timeout=60)
         if r.ssh_failed:
             return None, f"ssh failed (rc {r.rc}): {r.err.strip()[-200:]}"
         try:
@@ -674,7 +767,7 @@ class Monitor:
         except ValueError:
             return False, f"--status-json printed no JSON (rc {r.rc}): {(r.out + r.err)[-300:]}"
         if not isinstance(status, dict) or "running" not in status or status.get("error"):
-            # run3_status.py prints {"run": "run3", "error": ...} when it breaks. That
+            # the status script prints {"run": "<run>", "error": ...} when it breaks. That
             # says nothing about the run, so it must not count as a dead run.
             return False, f"--status-json reported an error: {str(status)[:300]}"
         return status, None
@@ -720,7 +813,7 @@ class Monitor:
             self.begin_teardown("done")
             return
         if status.get("done"):
-            return  # every phase is done; run3.sh is finishing up (wait for ALL DONE)
+            return  # every phase is done; the run script is finishing up (wait for ALL DONE)
         if not status.get("running"):
             phase = status.get("failed_phase") or status.get("current_phase") or "unknown"
             self.note_failure(phase, status)
@@ -729,11 +822,11 @@ class Monitor:
                 self.begin_teardown("phase_failed")
                 return
             self.st["restarts"] += 1
-            self.set_state("restarting", f"run3 tmux session dead in phase {phase}")
+            self.set_state("restarting", f"{self.n.tmux} tmux session dead in phase {phase}")
             ok = self.start_run(conn, why="restart")
-            self.event("restart", f"The run3 tmux session was dead in phase {phase} "
+            self.event("restart", f"The {self.n.tmux} tmux session was dead in phase {phase} "
                                   f"(failure {self.st['fail_count']} in a row). "
-                                  f"{'Restarted' if ok else 'Restart FAILED'} with run3_pod_start.sh (restart {self.st['restarts']}).")
+                                  f"{'Restarted' if ok else 'Restart FAILED'} with {Path(self.n.pod_start).name} (restart {self.st['restarts']}).")
             return
         if self.st["run_state"] == "restarting":
             self.set_state("stopping" if stopping else "running")
@@ -877,10 +970,10 @@ class Monitor:
             self.log(f"upload attempt {n}/{attempts}")
             self.save()
             r = conn.run("{ [ -f /workspace/env.sh ] && . /workspace/env.sh; } ; "
-                         "python scripts/upload_run3.py --final --verify", timeout=self.cfg["upload_timeout_s"])
+                         f"python {self.n.upload} --final --verify", timeout=self.cfg["upload_timeout_s"])
             if r.ok:
                 self.st["upload_verified"] = True
-                self.event("upload_verified", f"upload_run3.py --final --verify succeeded (attempt {n}).")
+                self.event("upload_verified", f"{Path(self.n.upload).name} --final --verify succeeded (attempt {n}).")
             else:
                 self.error(f"Upload attempt {n} failed (rc {r.rc}): {(r.err or r.out)[-400:]}")
         spend = self.spend()
@@ -903,7 +996,7 @@ class Monitor:
             return
         self.event("error", f"UPLOAD NOT VERIFIED ({'hard stop' if hard else reason}). The pod {rec['id'] if rec else '?'} "
                             f"is LEFT RUNNING at ${(rec or {}).get('cost_per_hr') or '?'}/hr so nothing is lost. "
-                            "Owner action needed: fix and run run3_go.sh --kill, or delete it in the Runpod console. "
+                            f"Owner action needed: fix and run scripts/{self.n.run}_go.sh --kill, or delete it in the Runpod console. "
                             f"The monitor deletes it automatically if spend reaches ${self.cfg['hard_stop_usd']:.0f}.")
         self.finish("failed", "upload not verified; pod left running")
 
@@ -917,7 +1010,7 @@ class Monitor:
     def finish(self, outcome: str, why: str) -> None:
         self.st["final_outcome"] = outcome
         self.set_state(outcome, why)
-        self.event("note", f"Run 3 monitor finished: {outcome.upper()} ({why}). Total spend ${self.spend():.2f}.")
+        self.event("note", f"{self.n.label} monitor finished: {outcome.upper()} ({why}). Total spend ${self.spend():.2f}.")
         try:
             self.paths.armed.unlink()
         except OSError:
@@ -1025,18 +1118,37 @@ def print_status(paths: Paths) -> int:
 def print_plan(paths: Paths) -> int:
     cfg = load_config(paths)
     env = load_env(paths.env)
-    prices = RunpodAPI(env.get("RUNPOD_API_KEY", "")).gpu_prices() if env.get("RUNPOD_API_KEY") else {}
-    print("Pod plan (tried in order until one has stock):")
-    for gpu, cloud in cfg["gpu_candidates"]:
+    api = RunpodAPI(env["RUNPOD_API_KEY"]) if env.get("RUNPOD_API_KEY") else None
+    prices = api.gpu_prices() if api else {}
+    n = paths.names
+    print(f"{n.label} pod plan:")
+
+    def line(step, gpu, cloud):
         g = prices.get(gpu) or {}
         price = g.get("securePrice" if cloud == "SECURE" else "communityPrice")
         hrs = cfg["hard_stop_usd"] / price if price else None
-        print(f"  {gpu:24s} {cloud:9s} ${price if price is not None else '?':>5}/hr"
+        print(f"  {step:<3s} {gpu_short(gpu):5s} {cloud:9s} ${price if price is not None else '?':>5}/hr"
               + (f"   (${cfg['hard_stop_usd']:.0f} hard stop after ~{hrs:.1f} h)" if hrs else ""))
+
+    print(f"  Community first: retry SXM, then PCIe, then NVL for up to {cfg['community_wait_s'] / 60:.0f} min.")
+    for i, g in enumerate(cfg["gpu_types"], 1):
+        line(f"{i}.", g, "COMMUNITY")
+    print("  Then fall back to Secure Cloud, in the same order:")
+    for i, g in enumerate(cfg["gpu_types"], 1):
+        line(f"{i + len(cfg['gpu_types'])}.", g, "SECURE")
     print(f"Image {cfg['image']}, container disk {cfg['container_disk_gb']} GB, no network volume.")
     print(f"Budget ${cfg['budget_usd']:.0f}: soft stop (end GRPO early) at ${cfg['soft_stop_usd']:.0f}, "
           f"forced teardown at ${cfg['hard_stop_usd']:.0f} or after {cfg['wall_limit_h']:.0f} h.")
     print(f"Pod generations capped at {cfg['max_generations']}; a phase that fails {cfg['max_phase_failures']} times in a row ends the run.")
+    need = cfg["hard_stop_usd"] + cfg["balance_margin_usd"]
+    balance = api.client_balance() if api else None
+    if balance is None:
+        print(f"Runpod balance: unknown (the query failed). The monitor refuses to create a pod it can't check; it needs ${need:.2f}.")
+    elif balance < need:
+        print(f"Runpod balance: ${balance:.2f}. TOO LOW: the monitor refuses to create a pod below ${need:.2f} "
+              f"(${cfg['hard_stop_usd']:.0f} hard stop + ${cfg['balance_margin_usd']:.0f} margin). Add at least ${need - balance:.2f}.")
+    else:
+        print(f"Runpod balance: ${balance:.2f} (needs at least ${need:.2f}). OK.")
     return 0
 
 
@@ -1047,15 +1159,16 @@ def queue_command(paths: Paths, cmd: str) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Run-3 monitor")
+    ap = argparse.ArgumentParser(description="Run monitor")
     ap.add_argument("command", nargs="?", default="run", choices=["run", "once", "status", "plan", "stop", "kill"])
     ap.add_argument("--dry-run", action="store_true", help="run the built-in fake-pod scenario and exit")
-    ap.add_argument("--home", default=None, help="override ~/cua-run3")
+    ap.add_argument("--home", default=None, help="override the home folder (default ~/cua-<run>)")
+    ap.add_argument("--run", default=None, help="run name, such as run4 (default: CUA_RUN, the install folder, or run4)")
     args = ap.parse_args(argv)
     if args.dry_run:
         from fakes import run_dry_scenario
         return run_dry_scenario(verbose=True)
-    paths = Paths(args.home)
+    paths = Paths(args.home, args.run)
     if args.command == "run":
         return run_loop(paths)
     if args.command == "once":

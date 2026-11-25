@@ -94,7 +94,7 @@ class RunpodAPI:
         req = urllib.request.Request(
             url or (self.base + path), data=data, method=method,
             headers={"Authorization": f"Bearer {self._key}", "Content-Type": "application/json",
-                     "User-Agent": "cua-run3-monitor/1"},
+                     "User-Agent": "cua-run-monitor/1"},
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
@@ -155,3 +155,17 @@ class RunpodAPI:
             return {g["id"]: g for g in (j or {}).get("data", {}).get("gpuTypes", []) or []}
         except (ApiError, KeyError, TypeError, AttributeError):
             return {}
+
+    def client_balance(self) -> float | None:
+        """The account's credit balance in dollars, or None when the query fails.
+
+        Uses the GraphQL query `myself { clientBalance }`. The key goes only in
+        the request header; nothing here prints it.
+        """
+        q = {"query": "query { myself { clientBalance } }"}
+        try:
+            _, j = self._req("POST", "", q, url=GRAPHQL)
+            v = ((j or {}).get("data") or {}).get("myself", {}).get("clientBalance")
+            return float(v) if v is not None else None
+        except (ApiError, KeyError, TypeError, ValueError, AttributeError):
+            return None

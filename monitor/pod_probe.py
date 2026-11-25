@@ -1,8 +1,9 @@
 """Runs ON THE POD (sent over SSH stdin as `python3 - ARGS`). Prints one JSON object.
 
-Collects, in one SSH round trip, what the collector needs: the status JSON, new
-metrics bytes, the run.log tail, eval summaries, sample folder names, GPU
-numbers, and wandb_run.json. Standard library only; never imports torch.
+Takes `--run runN` (default run4). Collects, in one SSH round trip, what the
+collector needs: the status JSON, new metrics bytes, the run.log tail, eval
+summaries, sample folder names, GPU numbers, and wandb_run.json. Standard
+library only; never imports torch.
 """
 
 import json
@@ -10,7 +11,6 @@ import os
 import subprocess
 import sys
 
-R = "results/run3"
 argv = sys.argv[1:]
 
 
@@ -20,10 +20,13 @@ def arg(name, default):
     return default
 
 
+RUN = arg("--run", "run4")
+R = f"results/{RUN}"
+
 out = {}
 
 try:
-    p = subprocess.run(["bash", "scripts/run3.sh", "--status-json"], capture_output=True, timeout=30)
+    p = subprocess.run(["bash", f"scripts/{RUN}.sh", "--status-json"], capture_output=True, timeout=30)
     t = p.stdout.decode(errors="replace").strip()
     out["status"] = json.loads(t[t.find("{"):]) if "{" in t else None
 except Exception as e:  # noqa: BLE001
@@ -31,7 +34,7 @@ except Exception as e:  # noqa: BLE001
     out["status_error"] = repr(e)[:300]
 
 # metrics.jsonl from a byte offset
-mpath = f"{R}/train/grpo-4b-run3/metrics.jsonl"
+mpath = f"{R}/train/grpo-4b-{RUN}/metrics.jsonl"
 off = int(arg("--metrics-offset", "0"))
 try:
     size = os.path.getsize(mpath)
@@ -39,8 +42,7 @@ try:
     with open(mpath, "rb") as f:
         if start > 0:
             # A GRPO resume trims and rewrites the file. If the saved offset no
-            # longer sits right after a newline, read from the start again; the
-            # collector sorts out replayed steps.
+            # longer sits right after a newline, read from the start again.
             f.seek(start - 1)
             if f.read(1) != b"\n":
                 start = 0
@@ -48,7 +50,11 @@ try:
         data = f.read(8_000_000)
     # Only whole lines.
     cut = data.rfind(b"\n") + 1
-    out["metrics"] = {"size": size, "start": start, "end": start + cut, "text": data[:cut].decode(errors="replace")}
+    # "reset" tells the collector that the file shrank or was rewritten (the saved
+    # offset was past the end or not on a line boundary), so it re-read from byte 0.
+    # Only then can rows the collector already has have changed.
+    out["metrics"] = {"size": size, "start": start, "end": start + cut, "reset": off > 0 and start == 0,
+                      "text": data[:cut].decode(errors="replace")}
 except OSError:
     out["metrics"] = None
 
