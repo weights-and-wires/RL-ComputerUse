@@ -48,6 +48,27 @@ class Base(unittest.TestCase):
 
 
 class TestLifecycle(Base):
+    def test_explicit_gpu_order_and_pod_env(self):
+        order = [["NVIDIA A100-SXM4-80GB", "SECURE"], ["NVIDIA A100 80GB PCIe", "SECURE"]]
+        mon, world, clock, paths, out = build(self.tmp, config={
+            "gpu_order": order, "pod_env": {"GRPO_MAX_HOURS": "12", "BAD NAME": "x", "X": "a;rm -rf /"}})
+        world.no_stock.add(("NVIDIA A100-SXM4-80GB", "SECURE"))
+        for _ in range(2):  # idle -> creating_pod, then the create call
+            clock.advance(60)
+            mon.tick()
+        rec = mon.pod_rec(mon.st["current_pod"])
+        # SXM had no stock, so the second entry wins at once; no Community wait.
+        self.assertEqual((rec["gpu"], rec["cloud"]), ("NVIDIA A100 80GB PCIe", "SECURE"))
+        for _ in range(3):
+            clock.advance(60)
+            mon.tick()
+        starts = [c for _, c in world.ssh_log if "run4_pod_start.sh" in c]
+        self.assertTrue(starts)
+        self.assertIn("GRPO_MAX_HOURS=12 ", starts[0])
+        self.assertIn("PRICE_PER_HR=", starts[0])
+        self.assertNotIn("rm -rf", starts[0])
+        self.assertNotIn("BAD NAME", starts[0])
+
     def test_full_scenario(self):
         mon, world, paths, p1, p2 = scenario_full(self.tmp, say=quiet)
         ev = events(paths)

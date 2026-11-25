@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import re
 import os
 import shlex
 import signal
@@ -76,6 +77,12 @@ DEFAULT_CONFIG = {
     # on Secure (2026-11-24). A lost Community pod is recreated and resumes from the
     # last synced checkpoint.
     "gpu_types": ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe", "NVIDIA H100 NVL"],  # SXM, PCIe, NVL
+    # An explicit [[gpu_id, cloud], ...] list. When set, the monitor tries it in
+    # order on every attempt and ignores gpu_types and community_wait_s.
+    "gpu_order": None,
+    # Extra variables for the pod-start script, for example {"GRPO_MAX_HOURS": "12"}.
+    # Only names the pod-start script passes through to the pipeline have an effect.
+    "pod_env": {},
     # Used for spend until the API reports the pod's own hourly rate.
     "fallback_cost_per_hr": 4.50,
     "ssh_key": "~/.ssh/id_ed25519",
@@ -128,8 +135,10 @@ def new_state() -> dict:
 
 
 def gpu_short(gpu_id: str) -> str:
-    """H100 variant name for messages: SXM, PCIe, or NVL."""
+    """GPU name for messages: SXM, PCIe, or NVL for an H100; A100 SXM or A100 PCIe for an A100."""
     g = (gpu_id or "").upper()
+    if "A100" in g:
+        return "A100 SXM" if "SXM" in g else "A100 PCIe" if "PCIE" in g else gpu_id
     return "SXM" if "HBM3" in g or "SXM" in g else "PCIe" if "PCIE" in g else "NVL" if "NVL" in g else gpu_id
 
 
@@ -548,7 +557,7 @@ class Monitor:
             self.st["create_since"] = now
         elapsed = now - self.st["create_since"]
         plan = self.gpu_plan(elapsed)
-        if elapsed >= self.cfg["community_wait_s"]:
+        if elapsed >= self.cfg["community_wait_s"] and not self.cfg.get("gpu_order"):
             self.note_once("secure_phase", f"No Community H100 stock after {int(elapsed // 60)} min. Falling back to "
                                            f"Secure Cloud in the order {', '.join(gpu_short(g) for g in self.cfg['gpu_types'])}.")
         self.st["create_attempts"] += 1
@@ -586,7 +595,7 @@ class Monitor:
                                  f"${rec['cost_per_hr'] or '?'}/hr, generation {gen}.")
                 self.set_state("bootstrapping", "pod created")
                 return
-        self.error(f"No H100 stock for any candidate (attempt {self.st['create_attempts']}): " + " | ".join(tried), loud=self.st["create_attempts"] % 5 == 1)
+        self.error(f"No GPU stock for any candidate (attempt {self.st['create_attempts']}): " + " | ".join(tried), loud=self.st["create_attempts"] % 5 == 1)
         if self.st["create_attempts"] >= self.cfg["max_create_attempts"]:
             self.finish("failed", "could not create a pod")
 
@@ -595,6 +604,8 @@ class Monitor:
 
         After the wait, Community stays on the list behind Secure as a last resort.
         """
+        if self.cfg.get("gpu_order"):
+            return [(g, c) for g, c in self.cfg["gpu_order"]]
         types = self.cfg["gpu_types"]
         community = [(g, "COMMUNITY") for g in types]
         secure = [(g, "SECURE") for g in types]
@@ -736,6 +747,11 @@ class Monitor:
         # full base-model suite runs only at $3.00/h or less).
         rate = (self.pod_rec() or {}).get("cost_per_hr")
         env = f"PRICE_PER_HR={float(rate):.2f} " if isinstance(rate, (int, float)) and rate > 0 else ""
+        for k, v in (self.cfg.get("pod_env") or {}).items():
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*", str(k)) and re.fullmatch(r"[A-Za-z0-9_.,:=/+-]*", str(v)):
+                env += f"{k}={v} "
+            else:
+                self.log(f"pod_env: skipped {k!r} (unsafe name or value)")
         r = conn.run(f"{env}bash {self.n.pod_start}", timeout=self.cfg["start_timeout_s"])
         text = (r.out or "")[-2000:]
         if r.ok and ("STARTED" in text or "ALREADY_RUNNING" in text):
@@ -1127,15 +1143,22 @@ def print_plan(paths: Paths) -> int:
         g = prices.get(gpu) or {}
         price = g.get("securePrice" if cloud == "SECURE" else "communityPrice")
         hrs = cfg["hard_stop_usd"] / price if price else None
-        print(f"  {step:<3s} {gpu_short(gpu):5s} {cloud:9s} ${price if price is not None else '?':>5}/hr"
+        print(f"  {step:<3s} {gpu_short(gpu):9s} {cloud:9s} ${price if price is not None else '?':>5}/hr"
               + (f"   (${cfg['hard_stop_usd']:.0f} hard stop after ~{hrs:.1f} h)" if hrs else ""))
 
-    print(f"  Community first: retry SXM, then PCIe, then NVL for up to {cfg['community_wait_s'] / 60:.0f} min.")
-    for i, g in enumerate(cfg["gpu_types"], 1):
-        line(f"{i}.", g, "COMMUNITY")
-    print("  Then fall back to Secure Cloud, in the same order:")
-    for i, g in enumerate(cfg["gpu_types"], 1):
-        line(f"{i + len(cfg['gpu_types'])}.", g, "SECURE")
+    if cfg.get("gpu_order"):
+        print("  Tried in this order on every attempt:")
+        for i, (g, c) in enumerate(cfg["gpu_order"], 1):
+            line(f"{i}.", g, c)
+    else:
+        print(f"  Community first: retry SXM, then PCIe, then NVL for up to {cfg['community_wait_s'] / 60:.0f} min.")
+        for i, g in enumerate(cfg["gpu_types"], 1):
+            line(f"{i}.", g, "COMMUNITY")
+        print("  Then fall back to Secure Cloud, in the same order:")
+        for i, g in enumerate(cfg["gpu_types"], 1):
+            line(f"{i + len(cfg['gpu_types'])}.", g, "SECURE")
+    if cfg.get("pod_env"):
+        print("Pipeline settings: " + " ".join(f"{k}={v}" for k, v in cfg["pod_env"].items()))
     print(f"Image {cfg['image']}, container disk {cfg['container_disk_gb']} GB, no network volume.")
     print(f"Budget ${cfg['budget_usd']:.0f}: soft stop (end GRPO early) at ${cfg['soft_stop_usd']:.0f}, "
           f"forced teardown at ${cfg['hard_stop_usd']:.0f} or after {cfg['wall_limit_h']:.0f} h.")
