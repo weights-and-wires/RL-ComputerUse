@@ -1,0 +1,14 @@
+# Evals for run 4 (docs/PLAN_RUN4.md): Track B with run 4's settings, so the
+# run-3 adapter (before) and the run-4 adapter (after) see the same prompt,
+# tools, and turn limits. scripts/run4.sh adds env.pool_size and, after the
+# select phase, env.turn_budgets.
+extends: eval.yaml
+run_name: eval-run4
+
+env:
+  track: B
+  max_turns: 20
+  context_window_turns: 4
+  track_b_extra_tools: true
+  turn_budgets: null
+  pool_size: 64

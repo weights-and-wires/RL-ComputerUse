@@ -347,6 +347,10 @@ def evaluate(
         "temperature": 0.0 if greedy else temperature,
         "track": cfg.env.track,
         "max_turns": int(cfg.env.max_turns),
+        # Run 4 settings that change what the model sees (absent or 0 before run 4).
+        "context_window_turns": int(cfg.env.get("context_window_turns", 0) or 0),
+        "track_b_extra_tools": bool(cfg.env.get("track_b_extra_tools", False)),
+        "turn_budgets": cfg.env.get("turn_budgets"),
         "format_error_rate_definition": "format-error turns / all turns",
         **metrics,
         "timings": {

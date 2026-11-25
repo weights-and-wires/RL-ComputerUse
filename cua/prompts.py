@@ -44,6 +44,13 @@ _TRACK_B = (
     "corner. To click, call mouse_click with coordinate [x, y]. To type into a field, click it first, then call keyboard_type.\n\n"
 )
 
+# Run 4 (env.track_b_extra_tools): the two extra Track B tools.
+_TRACK_B_EXTRA = (
+    "To double-click, call double_click with coordinate [x, y]. To drag an item, "
+    "move a slider, or select text, call left_click_drag with start_coordinate and "
+    "end_coordinate.\n\n"
+)
+
 _CLOSING = (
     "If an action fails, the next message starts with the error. Read it and "
     "try a different action. The episode ends when the task is complete. You "
@@ -51,15 +58,21 @@ _CLOSING = (
 )
 
 
-def system_prompt(track: Track) -> str:
+def system_prompt(track: Track, extended: bool = False) -> str:
     """Return the system prompt for a track.
 
     The prompt stays short because the chat template already adds the full tool
     schemas, and the whole system prompt is repeated in every training sample.
+
+    Args:
+        track: "A" or "B".
+        extended: Describe the extra Track B tools (run 4). Ignored on Track A.
     """
     if track not in ("A", "B"):
         raise ValueError(f"Unknown track {track!r}. Use 'A' or 'B'.")
-    return _COMMON + (_TRACK_A if track == "A" else _TRACK_B) + _CLOSING
+    if track == "A":
+        return _COMMON + _TRACK_A + _CLOSING
+    return _COMMON + _TRACK_B + (_TRACK_B_EXTRA if extended else "") + _CLOSING
 
 
 def observation_text(obs: Observation, track: Track) -> str:
@@ -99,7 +112,9 @@ def first_observation_blocks(obs: Observation, track: Track, with_image: bool) -
     return _content_blocks(obs, track, with_image)
 
 
-def initial_messages(obs: Observation, track: Track, with_image: bool) -> list[dict[str, Any]]:
+def initial_messages(
+    obs: Observation, track: Track, with_image: bool, extended: bool = False
+) -> list[dict[str, Any]]:
     """Build `[system, user]` for the first turn.
 
     Args:
@@ -107,14 +122,80 @@ def initial_messages(obs: Observation, track: Track, with_image: bool) -> list[d
         track: "A" or "B".
         with_image: Include the first screenshot in the user message. Pass
             `cfg.env.first_obs_image` so training and eval agree.
+        extended: Describe the extra Track B tools (run 4).
     """
     return [
-        {"role": "system", "content": system_prompt(track)},
+        {"role": "system", "content": system_prompt(track, extended)},
         {
             "role": "user",
             "content": [{"type": "text", "text": USER_PREAMBLE}]
             + first_observation_blocks(obs, track, with_image),
         },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# History window (run 4: env.context_window_turns)
+# ---------------------------------------------------------------------------
+#
+# With a window of W turns, an episode is a chain of *segments*. Each segment
+# is a complete conversation of its own:
+#
+#     system   the same system prompt
+#     user     preamble, a text log of every earlier turn, then the current
+#              observation (screenshot and goal)
+#     assistant / tool / assistant / tool ...   at most W turns
+#
+# At turn t of a segment, the prompt is the segment's messages up to that
+# turn, so it is always a prefix of the finished segment. Training scores each
+# segment as one sequence, so the trainer sees exactly the tokens the sampler
+# saw, and vLLM's prefix cache still hits inside a segment. The model sees
+# between 1 and W screenshots, never more.
+
+HISTORY_HEADER = "Earlier actions in this episode, oldest first:"
+_MAX_ARG_CHARS = 80
+
+
+def history_line(index: int, action: str, error: str = "") -> str:
+    """One line of the earlier-actions log, for example `3. mouse_click(coordinate=[412, 230])`.
+
+    Args:
+        index: The 1-based turn number.
+        action: The tool call as text (`cua.samples.action_text`), or empty
+            when the response had no valid tool call.
+        error: The error that turn produced, if any.
+    """
+    text = action or "(no valid tool call)"
+    if len(text) > _MAX_ARG_CHARS:
+        text = text[: _MAX_ARG_CHARS - 3] + "..."
+    if error:
+        err = " ".join(str(error).split())
+        text += f" -> error: {err[:_MAX_ARG_CHARS]}"
+    return f"{index}. {text}"
+
+
+def segment_messages(
+    obs: Observation, track: Track, with_image: bool, history: list[str], extended: bool = False
+) -> list[dict[str, Any]]:
+    """Build `[system, user]` that opens a new segment of a windowed episode.
+
+    Args:
+        obs: The current observation (the result of the last action).
+        track: "A" or "B".
+        with_image: Include the screenshot. A new segment always needs it,
+            because the earlier screenshots are gone, so callers pass True.
+        history: Lines from `history_line`, one per earlier turn.
+        extended: Describe the extra Track B tools (run 4).
+    """
+    # The chat template joins text blocks without a separator, so the log
+    # carries its own blank lines.
+    log = "\n\n" + HISTORY_HEADER + "\n" + "\n".join(history) + "\n\n" if history else ""
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": USER_PREAMBLE}]
+    if log:
+        blocks.append({"type": "text", "text": log})
+    return [
+        {"role": "system", "content": system_prompt(track, extended)},
+        {"role": "user", "content": blocks + first_observation_blocks(obs, track, with_image)},
     ]
 
 

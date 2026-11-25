@@ -263,6 +263,8 @@ def clipped_pg_loss(
     eps_high: float,
     loss_type: str = "dr_grpo",
     max_tokens_norm: float | None = None,
+    ratio_cap: float | None = None,
+    is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Computes the PPO-style clipped policy-gradient loss, token by token.
 
@@ -304,6 +306,17 @@ def clipped_pg_loss(
       max_tokens_norm: Constant divisor for `dr_grpo`: the largest number of
         assistant tokens an episode can have. If None, the longest sequence in
         this batch is used, which makes the scale batch-dependent.
+      ratio_cap: Dual-clip bound `c` (run 4), for example 3.0. PPO's clip
+        bounds the objective only on one side: for a negative advantage,
+        `min(r * A, clip(r) * A)` keeps falling as `r` grows, so one token
+        whose probability jumped (run 3, step 207: ratio 3.2e6) can dominate
+        the loss and the gradient. With a cap, the objective for A < 0 never
+        goes below `c * A`, so tokens with `r > c` add a constant and no
+        gradient. For A > 0 the PPO clip already bounds it. None turns it off.
+      is_weights: Optional `[B, T]` per-token weights, detached, that multiply
+        the per-token loss. Run 4 passes truncated importance-sampling weights
+        (`tis_weights`) that correct for the gap between vLLM's and the
+        trainer's log-probs.
 
     Returns:
       A tuple `(loss, metrics)`. `loss` is a scalar tensor normalized over the
@@ -311,7 +324,10 @@ def clipped_pg_loss(
       tokens where clipping changed the result), `approx_kl` (the k3 estimator
       of KL(old || new)), `ratio_mean`, `ratio_max`, and `entropy_proxy`
       (-mean of the sampled-token log-prob, which tracks entropy because the
-      tokens were sampled from the policy).
+      tokens were sampled from the policy). With `ratio_cap`, also
+      `ratio_capped_frac` (share of tokens where the cap bound the
+      objective) and `ratio_over_cap_frac` (share of tokens with `r > c`,
+      any advantage sign).
     """
     if loss_type not in LOSS_TYPES:
         raise ValueError(f"loss_type must be one of {LOSS_TYPES}, got {loss_type!r}")
@@ -324,7 +340,18 @@ def clipped_pg_loss(
     clipped_ratio = ratio.clamp(1.0 - eps_low, 1.0 + eps_high)
     unclipped_obj = ratio * adv
     clipped_obj = clipped_ratio * adv
-    per_token = -torch.min(unclipped_obj, clipped_obj) * mask
+    obj = torch.min(unclipped_obj, clipped_obj)
+    capped = torch.zeros_like(obj, dtype=torch.bool)
+    if ratio_cap is not None:
+        if ratio_cap <= 1.0 + eps_high:
+            raise ValueError(f"ratio_cap must be above 1 + eps_high, got {ratio_cap}")
+        # Dual clip: for A < 0, never let the objective fall below c * A.
+        floor = ratio_cap * adv.expand_as(obj)
+        capped = (adv < 0).expand_as(obj) & (obj < floor)
+        obj = torch.where(capped, floor, obj)
+    per_token = -obj * mask
+    if is_weights is not None:
+        per_token = per_token * is_weights.detach().to(per_token.dtype)
 
     num_seqs = per_token.shape[0]
     seq_tokens = mask.sum(dim=1)
@@ -350,4 +377,158 @@ def clipped_pg_loss(
             "ratio_max": (ratio * mask).max().item(),
             "entropy_proxy": (-(new_logp * mask).sum() / n).item(),
         }
+        if ratio_cap is not None:
+            metrics["ratio_capped_frac"] = ((capped.float() * mask).sum() / n).item()
+            metrics["ratio_over_cap_frac"] = (((ratio > ratio_cap).float() * mask).sum() / n).item()
     return loss, metrics
+
+
+# ---------------------------------------------------------------------------
+# Sampler mismatch (run 4): vLLM's log-probs against the trainer's
+# ---------------------------------------------------------------------------
+#
+# vLLM samples each token with its own kernels; the trainer re-scores the same
+# text in PyTorch. The two log-probs differ by small noise, and sometimes by a
+# lot: when re-tokenizing the text gives other tokens than vLLM sampled, or a
+# token vLLM drew is one the trainer finds very unlikely. Run 3's one blow-up
+# (step 207) came on a step with a token-count mismatch. Run 4 handles this
+# in three layers: drop sequences that don't line up or differ too much
+# (`filter_mismatched`), weight the rest by truncated importance sampling
+# (`tis_weights`), and cap the PPO ratio (`clipped_pg_loss(ratio_cap=...)`).
+
+
+def align_sampler_logprobs(
+    mask_row: list[int], turn_logprobs: list[list[float]], turn_finish: list[str]
+) -> tuple[list[float], bool]:
+    """Places vLLM's per-token log-probs at the trainer's assistant positions.
+
+    The assistant mask of one sequence has one run of 1s per assistant
+    message: the response tokens plus `<|im_end|>`. vLLM's token list for a
+    turn includes `<|im_end|>` when generation stopped on it, so the counts
+    match. When generation hit the token limit (`finish_reason == "length"`),
+    the template still adds `<|im_end|>`, which vLLM never sampled: that one
+    position gets NaN.
+
+    Pure Python, so it's cheap to test.
+
+    Args:
+      mask_row: The assistant mask of one sequence, as 0/1 integers.
+      turn_logprobs: vLLM's log-probs for each assistant turn of the sequence,
+        in order.
+      turn_finish: vLLM's finish reason for each of those turns.
+
+    Returns:
+      `(values, ok)`. `values` has one float per position of `mask_row`, NaN
+      wherever no sampler value applies (outside the mask, or not aligned).
+      `ok` is False when the spans and turns don't line up, which means the
+      re-tokenized text isn't what vLLM sampled.
+    """
+    nan = float("nan")
+    values = [nan] * len(mask_row)
+    spans: list[tuple[int, int]] = []
+    start = None
+    for i, m in enumerate(list(mask_row) + [0]):
+        if m and start is None:
+            start = i
+        elif not m and start is not None:
+            spans.append((start, i))
+            start = None
+    if len(spans) != len(turn_logprobs) or not spans:
+        return values, False
+    ok = True
+    for (a, b), lps, finish in zip(spans, turn_logprobs, turn_finish):
+        n = b - a
+        if len(lps) == n:
+            values[a:b] = [float(x) for x in lps]
+        elif finish == "length" and len(lps) == n - 1:
+            values[a : b - 1] = [float(x) for x in lps]
+        else:
+            ok = False
+    return values, ok
+
+
+def mean_abs_diff(trainer_logp: list[float], sampler_logp: list[float], mask_row: list[int]) -> float:
+    """Mean |trainer - sampler| over masked positions with a sampler value (NaN when none)."""
+    diffs = [abs(t - s) for t, s, m in zip(trainer_logp, sampler_logp, mask_row) if m and s == s]
+    return sum(diffs) / len(diffs) if diffs else float("nan")
+
+
+def filter_mismatched(
+    diffs: dict, aligned: dict, threshold: float | None, max_drop_frac: float = 0.25
+) -> tuple[set, dict[str, float]]:
+    """Chooses the episodes to leave out of the update because of sampler mismatch.
+
+    An episode is dropped when any of its sequences didn't align (`aligned`
+    False) or its largest per-sequence mean |trainer - sampler| log-prob
+    difference is above `threshold`. At most `max_drop_frac` of the episodes
+    are dropped, the worst first, so a systematic shift (a template change,
+    say) can't silently empty the batch; the metrics show it instead.
+
+    Args:
+      diffs: {episode key: largest mean abs diff over its sequences, NaN if none}.
+      aligned: {episode key: True when every sequence aligned}.
+      threshold: Drop above this diff. None keeps every aligned episode.
+      max_drop_frac: Upper bound on the share of episodes dropped.
+
+    Returns:
+      `(dropped keys, metrics)`. Metrics: `sampler/dropped_episodes`,
+      `sampler/dropped_unaligned`, `sampler/dropped_over_threshold`,
+      `sampler/drop_capped` (1 when the cap kept some that qualified), and
+      `sampler/max_abs_logp_diff`.
+    """
+    keys = list(diffs)
+
+    def badness(k) -> float:
+        d = diffs[k]
+        return float("inf") if not aligned.get(k, False) else (-1.0 if d != d else d)
+
+    unaligned = [k for k in keys if not aligned.get(k, False)]
+    over = [k for k in keys if aligned.get(k, False) and threshold is not None
+            and diffs[k] == diffs[k] and diffs[k] > threshold]
+    candidates = sorted(unaligned + over, key=badness, reverse=True)
+    limit = int(max_drop_frac * len(keys))
+    dropped = set(candidates[:limit])
+    finite = [diffs[k] for k in keys if diffs[k] == diffs[k]]
+    metrics = {
+        "sampler/dropped_episodes": float(len(dropped)),
+        "sampler/dropped_unaligned": float(len([k for k in unaligned if k in dropped])),
+        "sampler/dropped_over_threshold": float(len([k for k in over if k in dropped])),
+        "sampler/drop_capped": float(len(candidates) > limit),
+        "sampler/max_abs_logp_diff": max(finite) if finite else float("nan"),
+    }
+    return dropped, metrics
+
+
+def tis_weights(
+    trainer_logp: torch.Tensor, sampler_logp: torch.Tensor, mask: torch.Tensor, cap: float
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Truncated importance-sampling weights `min(pi_trainer / pi_sampler, cap)`, per token.
+
+    vLLM drew the tokens, but the loss assumes the trainer's own policy drew
+    them. Multiplying each token's loss by the ratio of the two probabilities
+    corrects that; truncating at `cap` bounds the variance. A token the
+    trainer finds far less likely than vLLM did gets a weight near 0, so it
+    can't produce a huge gradient. Positions without a sampler value (NaN)
+    get weight 1.
+
+    Args:
+      trainer_logp: `[B, T]` trainer log-probs of the policy that sampled (old).
+      sampler_logp: `[B, T]` vLLM log-probs, NaN where unknown.
+      mask: `[B, T]` assistant mask.
+      cap: Upper bound on the weight, for example 2.0.
+
+    Returns:
+      `(weights, metrics)`, weights detached with the shape of `mask`.
+      Metrics: `tis_weight_mean` and `tis_capped_frac` over masked tokens.
+    """
+    mask = mask.float()
+    known = ~torch.isnan(sampler_logp)
+    log_w = torch.where(known, trainer_logp.detach() - torch.nan_to_num(sampler_logp), torch.zeros_like(trainer_logp))
+    w = torch.exp(log_w.clamp(max=20.0)).clamp(max=cap)
+    w = torch.where(mask > 0, w, torch.ones_like(w)).detach()
+    n = mask.sum().clamp(min=1)
+    metrics = {
+        "tis_weight_mean": ((w * mask).sum() / n).item(),
+        "tis_capped_frac": (((log_w.exp() > cap) & known).float().mul(mask).sum() / n).item(),
+    }
+    return w, metrics

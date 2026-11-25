@@ -159,14 +159,18 @@ class Turn:
     observation: Observation
     """The observation the model acted on."""
     prompt_len: int
-    """Number of messages in Episode.messages that formed this turn's prompt.
-    Episode.messages[:prompt_len] is the exact input; the next message is this
-    turn's assistant reply. nano_grpo and RFT rebuild per-turn inputs from it."""
+    """Number of messages in this turn's conversation that formed its prompt.
+    `Episode.conversations()[segment][:prompt_len]` is the exact input; the
+    next message is this turn's assistant reply. Without a history window
+    there is one conversation, `Episode.messages`."""
     generation: Generation
     parsed: ParsedAction
     env_error: str = ""
     """`last_action_error` reported by BrowserGym after executing the action,
     or the tool-argument error from the parser."""
+    segment: int = 0
+    """Index of the conversation this turn belongs to (run 4's history window,
+    `env.context_window_turns`). Always 0 without a window."""
 
 
 @dataclass
@@ -206,7 +210,13 @@ class Episode:
     """The full conversation in HF chat format: system, user (goal and first
     observation), then alternating assistant (raw model text) and tool
     (screenshot and page text) messages. Images are PIL objects inside
-    content blocks. This is exactly what RFT trains on."""
+    content blocks. This is exactly what RFT trains on.
+
+    With a history window (run 4), this holds only the newest segment, and
+    `segments` holds the earlier ones. Use `conversations()` to get all."""
+    segments: list[list[dict[str, Any]]] = field(default_factory=list)
+    """Finished earlier segments of a windowed episode, oldest first. Each is a
+    complete conversation that ends with an assistant message."""
     success: bool = False
     raw_env_reward: float = 0.0
     """Last reward value BrowserGym returned (MiniWoB's own score)."""
@@ -223,6 +233,24 @@ class Episode:
     @property
     def num_turns(self) -> int:
         return len(self.turns)
+
+    def conversations(self) -> list[list[dict[str, Any]]]:
+        """Every conversation of the episode, in order: earlier segments, then `messages`.
+
+        Training scores each one as its own sequence. Without a history window
+        this is `[messages]`. Index i matches `Turn.segment == i`. The newest
+        conversation is left out when it has no assistant message yet (the
+        episode ended before the model spoke in it); earlier segments always
+        have one.
+        """
+        convs = list(self.segments) + [self.messages]
+        if not any(m.get("role") == "assistant" for m in convs[-1]):
+            convs = convs[:-1]
+        return convs
+
+    def turns_in(self, segment: int) -> list["Turn"]:
+        """The turns of one conversation, in order."""
+        return [t for t in self.turns if t.segment == segment]
 
     @property
     def num_format_errors(self) -> int:
@@ -252,6 +280,7 @@ class Episode:
             "success": self.success,
             "raw_env_reward": self.raw_env_reward,
             "num_turns": self.num_turns,
+            "num_segments": len(self.segments) + 1,
             "num_format_errors": self.num_format_errors,
             "truncated": self.truncated,
             "crashed": self.crashed,

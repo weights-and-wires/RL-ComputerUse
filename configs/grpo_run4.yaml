@@ -1,0 +1,84 @@
+# Run 4: GRPO on Track B from the run-3 adapter, with 20 turns, a history
+# window, double_click and left_click_drag, and a guard against the sampler
+# mismatch. See docs/PLAN_RUN4.md.
+#
+# Differences from run 3 (grpo_run3.yaml):
+#   - 20 turns, with per-task budgets from the screen (env.turn_budgets)
+#   - a history window: a new conversation every 4 turns, with a text log of
+#     the earlier turns, so a prompt holds at most 4 screenshots
+#   - double_click and left_click_drag on Track B
+#   - 64 browsers, 12 groups per rollout round, and more GPU memory for vLLM
+#   - a dual-clip ratio cap, truncated importance sampling, and dropping
+#     episodes whose vLLM and trainer log-probs don't agree
+#   - the best mid-training adapter is kept (best/), and mid-training evals
+#     use the baseline seed range, never the headline eval seeds
+#
+# scripts/run4.sh sets model.adapter (the run-3 adapter), env.pool_size (the
+# size the smoke check passed), and env.turn_budgets, and runs with
+# CUA_RESULTS_DIR=results/run4, so `tasks: selected` reads the run-4 pool.
+extends: grpo_run3.yaml
+run_name: grpo-4b-run4
+
+model:
+  adapter: null             # set with --set model.adapter=...
+
+env:
+  track: B
+  max_turns: 20             # run 3: 10. Eight pool tasks ran out of turns at 10.
+  context_window_turns: 4   # 0 = full history (runs 1-3)
+  track_b_extra_tools: true # double_click and left_click_drag
+  turn_budgets: null        # run4.sh: results/run4/turn_budgets.json
+  pool_size: 64             # run4.sh: the size that `cua.smoke4 browsers` passed
+
+grpo:
+  output_dir: /workspace/ckpt/grpo-4b-run4
+  max_steps: 400            # a ceiling; the time cap (GRPO_MAX_HOURS) ends the run first
+  learning_rate: 1.0e-5     # fresh AdamW, as in runs 2 and 3
+  warmup_steps: 10
+  save_steps: 10
+  save_total_limit: 4
+  # vLLM's share of the H100. 64 browsers keep up to 64 prompts of about 2,000
+  # tokens in the KV cache (about 19 GB at 147 KB per token). Run 3 used 0.35
+  # with training peaking at 17 GB, so 0.42 leaves about 30 GB for training.
+  vllm_gpu_memory_utilization: 0.42
+
+  # 12 groups (96 episodes) per round on 64 browsers: browsers that finish
+  # early pick up the next episode instead of waiting for the round's longest one.
+  prompts_per_step: 12
+  num_generations: 8
+  dynamic_sampling:
+    enabled: true
+    min_mixed_groups: 6
+    max_rounds: 3
+    max_train_groups: 6
+
+  # Run 3 used train seeds from 301000 (about 300 per task); start past them.
+  train_seed_offset: 500000
+
+  # dr_grpo's divisor, pinned to run 3's 10 turns x 160 tokens, so 20 turns
+  # don't halve the gradient scale per token.
+  max_tokens_norm: 1600
+
+  # The sampler-mismatch guard (cua/nano_grpo/loss.py). Each part logs how
+  # often it acts: train/ratio_capped_frac, train/tis_capped_frac,
+  # sampler/dropped_episodes.
+  ratio_cap: 3.0            # dual clip: for A < 0, the objective stops at 3 * A
+  sampler_check:
+    enabled: true
+    tis_cap: 2.0            # per-token weight min(pi_trainer / pi_vllm, 2)
+    max_mean_abs_diff: 0.15 # drop an episode above this (run 3: 0.01-0.09 per step)
+    drop_unaligned: true    # and when its tokens don't line up with vLLM's (run 3, step 207)
+    max_drop_frac: 0.25     # never drop more than a quarter of a step's episodes
+
+  eval_every: 25
+  eval_num_seeds: 20
+  eval_seed_range: baseline # not the headline seeds: the best checkpoint is chosen on these
+  keep_best: true           # save best/ when a mid-training eval sets a record
+
+  sampler: adaptive
+  adaptive:
+    ema_alpha: 0.2
+    floor: 0.10
+
+  stop_file: .stop_grpo
+  samples_every: 5

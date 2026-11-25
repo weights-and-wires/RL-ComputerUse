@@ -151,6 +151,13 @@ class TaskSpec:
     run2_pool: list[str] = field(default_factory=list)
     heldout_v2: list[str] = field(default_factory=list)
     """Run 2's held-out v2 list, frozen in tasks.yaml (results/ isn't in git)."""
+    train_candidates_run4_new_action: list[str] = field(default_factory=list)
+    train_candidates_run4_extra: list[str] = field(default_factory=list)
+    run3_pool: list[str] = field(default_factory=list)
+    run4_long_horizon: list[str] = field(default_factory=list)
+    run4_turn_limited: list[str] = field(default_factory=list)
+    run4_exclude: dict[str, str] = field(default_factory=dict)
+    full_suite_exclude: dict[str, str] = field(default_factory=dict)
 
     @property
     def train_candidates_run2(self) -> list[str]:
@@ -160,6 +167,15 @@ class TaskSpec:
     def train_candidates_run3(self) -> list[str]:
         base = self.train_candidates_run2
         return base + [t for t in self.train_candidates_run3_extra if t not in base]
+
+    @property
+    def train_candidates_run4(self) -> list[str]:
+        """Run 3's candidates without `run4_exclude`, plus the drag tasks and the unscreened extras."""
+        out = [t for t in self.train_candidates_run3 if t not in self.run4_exclude]
+        for t in self.train_candidates_run4_new_action + self.train_candidates_run4_extra:
+            if t not in out and t not in self.run4_exclude:
+                out.append(t)
+        return out
 
     def seed_range(self, name: str) -> SeedRange:
         """Seed range by purpose: 'eval', 'baseline', 'rft', or 'train'."""
@@ -180,6 +196,13 @@ def load_tasks(path: str | os.PathLike = CONFIG_DIR / "tasks.yaml") -> TaskSpec:
         train_candidates_run3_extra=list(data.get("train_candidates_run3_extra") or []),
         run2_pool=list(data.get("run2_pool") or []),
         heldout_v2=list(data.get("heldout_v2") or []),
+        train_candidates_run4_new_action=list(data.get("train_candidates_run4_new_action") or []),
+        train_candidates_run4_extra=list(data.get("train_candidates_run4_extra") or []),
+        run3_pool=list(data.get("run3_pool") or []),
+        run4_long_horizon=list(data.get("run4_long_horizon") or []),
+        run4_turn_limited=list(data.get("run4_turn_limited") or []),
+        run4_exclude=dict(data.get("run4_exclude") or {}),
+        full_suite_exclude=dict(data.get("full_suite_exclude") or {}),
     )
     _check_heldout_disjoint(spec)
     return spec
@@ -187,7 +210,7 @@ def load_tasks(path: str | os.PathLike = CONFIG_DIR / "tasks.yaml") -> TaskSpec:
 
 def _check_heldout_disjoint(spec: TaskSpec) -> None:
     """Fail fast if a held-out task could ever be trained on."""
-    train = set(spec.train_candidates_run3)
+    train = set(spec.train_candidates_run3) | set(spec.train_candidates_run4)
     leaked = train & (set(spec.heldout) | set(spec.heldout_v2_candidates) | set(spec.heldout_v2))
     if leaked:
         raise ValueError(f"held-out tasks also listed as training candidates: {sorted(leaked)}; fix configs/tasks.yaml")
@@ -227,6 +250,43 @@ def heldout_v2_path(cfg: Optional[Config] = None) -> Path:
     return results_dir(cfg) / "heldout_v2.json"
 
 
+_BUDGET_CACHE: dict[str, dict[str, int]] = {}
+
+
+def turn_budgets(cfg: Config) -> dict[str, int]:
+    """Per-task turn limits from `env.turn_budgets` (run 4), or {} when unset.
+
+    The value is either a mapping {task: turns} or the path of a JSON file
+    (relative to the repository root) that holds such a mapping, or an object
+    with a "budgets" key, as `cua.run_pool budgets` writes it. A path that
+    doesn't exist raises, so a run never silently uses other limits than the
+    ones its config names.
+    """
+    raw = (cfg.get("env") or {}).get("turn_budgets")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): int(v) for k, v in raw.items()}
+    path = Path(str(raw))
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    key = str(path)
+    if key not in _BUDGET_CACHE:
+        if not path.exists():
+            raise FileNotFoundError(f"env.turn_budgets names {path}, which doesn't exist.")
+        data = json.loads(path.read_text())
+        data = data.get("budgets", data) if isinstance(data, dict) else {}
+        _BUDGET_CACHE[key] = {str(k): int(v) for k, v in data.items()}
+    return dict(_BUDGET_CACHE[key])
+
+
+def turn_limit(cfg: Config, task: str) -> int:
+    """The turn limit for one task: its budget from `env.turn_budgets`, capped at `env.max_turns`."""
+    max_turns = int(cfg.env.max_turns)
+    budget = turn_budgets(cfg).get(task, max_turns)
+    return max(1, min(max_turns, int(budget)))
+
+
 def resolve_task_list(names: list[str] | str, cfg: Optional[Config] = None) -> list[str]:
     """Expand the symbolic task-list names used in configs and CLIs.
 
@@ -241,6 +301,11 @@ def resolve_task_list(names: list[str] | str, cfg: Optional[Config] = None) -> l
       (results/heldout_v2.json, written by select_tasks.py --heldout-extra);
       without that file, the list frozen in tasks.yaml
     - "run1_pool": run 1's training pool
+    - "candidates_run4": run 4's screening candidates
+    - "run3_pool": run 3's training pool (frozen in tasks.yaml)
+    - "run4_turn_limited", "run4_new_action": run 4's task groups
+    - "full_suite": every task of run 4's full-suite eval
+      (results/<run>/full_suite.json, written by `cua.run_pool registered`)
     - anything else: a literal comma-separated list or a YAML list of names
     """
     spec = load_tasks()
@@ -261,6 +326,19 @@ def resolve_task_list(names: list[str] | str, cfg: Optional[Config] = None) -> l
             return spec.heldout_v2_candidates
         if names == "run1_pool":
             return spec.run1_pool
+        if names == "candidates_run4":
+            return spec.train_candidates_run4
+        if names == "run3_pool":
+            return spec.run3_pool
+        if names == "run4_turn_limited":
+            return spec.run4_turn_limited
+        if names == "run4_new_action":
+            return spec.train_candidates_run4_new_action
+        if names == "full_suite":
+            path = results_dir(cfg) / "full_suite.json"
+            if not path.exists():
+                raise FileNotFoundError(f"{path} not found. Run `python -m cua.run_pool registered --run run4` first.")
+            return list(json.loads(path.read_text())["tasks"])
         if names == "heldout_v2":
             path = heldout_v2_path(cfg)
             if not path.exists() and spec.heldout_v2:

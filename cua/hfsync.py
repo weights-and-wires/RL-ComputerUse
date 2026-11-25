@@ -1,18 +1,23 @@
-"""Run 3's link to Hugging Face: the sync loop, restore on a new pod, and the final upload.
+"""A run's link to Hugging Face: the sync loop, restore on a new pod, and the final upload.
 
-Command line (on the pod, with HF_TOKEN and HF_ADAPTER_REPO set):
+Command line (on the pod, with HF_TOKEN and HF_ADAPTER_REPO set). `--run`
+picks the run (default: $CUA_RUN, else run3), so run 3 works as before:
 
-    python -m cua.hfsync loop        # runs in tmux session run3-sync
-    python -m cua.hfsync once        # one sync pass
-    python -m cua.hfsync restore     # on a new pod, before run3.sh starts
-    python -m cua.hfsync final [--verify]   # what scripts/upload_run3.py calls
+    python -m cua.hfsync [--run run4] loop      # runs in tmux session run4-sync
+    python -m cua.hfsync [--run run4] once      # one sync pass
+    python -m cua.hfsync [--run run4] restore   # on a new pod, before run4.sh starts
+    python -m cua.hfsync [--run run4] final [--verify]   # what scripts/upload_run4.py calls
 
-Remote layout in HF_ADAPTER_REPO:
+Remote layout in HF_ADAPTER_REPO, for run N (3 or 4):
 
-    checkpoints/grpo-4b-run3/checkpoint-N/   GRPO checkpoints (adapter, optimizer, RNG, sampler)
-    checkpoints/grpo-4b-run3/final/          the final adapter
-    checkpoints/rft-4b-run3/final/           the RFT adapter, only if the rft phase ran
-    results/run3/                            markers, logs, metrics, evals, samples, W&B files
+    checkpoints/grpo-4b-runN/checkpoint-K/   GRPO checkpoints (adapter, optimizer, RNG, sampler)
+    checkpoints/grpo-4b-runN/final/          the final adapter
+    checkpoints/grpo-4b-runN/best/           run 4: the adapter with the best mid-training eval
+    checkpoints/rft-4b-runN/final/           the RFT adapter, only if the rft phase ran
+    results/runN/                            markers, logs, metrics, evals, samples, W&B files
+
+Each run starts from the previous run's adapter: run 3 from run 2's, run 4
+from run 3's (`checkpoints/grpo-4b-run3/final`).
 
 The sync loop never blocks training: it runs in its own process, reads only
 finished files (checkpoints appear by an atomic rename), and catches every
@@ -21,8 +26,9 @@ error. It uploads:
 1. The newest finished checkpoint, if it's newer than `.synced_checkpoint`.
    So a checkpoint is never uploaded twice, even across pods, because
    `.synced_checkpoint` is synced and restored too.
-2. The final and RFT adapters, once their phase is done.
-3. Every small file under results/run3 whose size or modification time changed.
+2. The final and RFT adapters, once their phase is done, and the best
+   adapter (run 4) whenever its `best.json` changes.
+3. Every small file under results/runN whose size or modification time changed.
 
 Adapters go up before the markers, so a `grpo.done` on the Hub implies the
 final adapter is there too.
@@ -61,6 +67,21 @@ RUN2_RESULT_FILES = (
     "results/run2/eval/run2-pool2/summary.json",
     "results/run2/eval/run2-pool2/per_task.csv",
 )
+# Run-3 inputs that run 4 needs. The summaries feed the report's journey table
+# (base, run 1, run 2, run 3 on held-out v2). All are optional.
+RUN3_REMOTE_CKPT = "checkpoints/grpo-4b-run3"
+RUN3_RESULT_FILES = (
+    "results/run3/heldout_v2.json",
+    "results/run3/selected_tasks.json",
+    "results/run3/eval/base-heldout3/summary.json",
+    "results/run3/eval/run2-heldout3/summary.json",
+    "results/run3/eval/run3-heldout3/summary.json",
+    "results/run3/eval/run3-pool3/summary.json",
+    "results/run2/eval/base-heldout2/summary.json",
+    "results/run2/eval/run1-heldout2/summary.json",
+    "results/run2/eval/run2-heldout2/summary.json",
+)
+BEST_FILE = "best.json"  # inside checkpoints/.../best/, written by nano_grpo when grpo.keep_best is on
 
 
 def log(msg: str) -> None:
@@ -69,7 +90,11 @@ def log(msg: str) -> None:
 
 @dataclass
 class Layout:
-    """Where run 3 keeps things, locally and on the Hub."""
+    """Where a run keeps things, locally and on the Hub. The defaults are run 3's.
+
+    `run2_adapter_dir` is the start adapter that the run restores: run 2's for
+    run 3, run 3's for run 4 (the name stays for run 3's callers).
+    """
 
     repo_root: Path = REPO_ROOT
     results: Path = REPO_ROOT / "results" / "run3"
@@ -80,17 +105,61 @@ class Layout:
     remote_ckpt: str = "checkpoints/grpo-4b-run3"
     remote_rft: str = "checkpoints/rft-4b-run3/final"
     remote_results: str = "results/run3"
+    run: str = "run3"
+    prev_run: str = "run2"
+    prev_remote_ckpt: str = RUN2_REMOTE_CKPT
+    prev_result_files: tuple[str, ...] = RUN2_RESULT_FILES
 
     @classmethod
-    def from_env(cls) -> "Layout":
-        lay = cls()
+    def for_run(cls, run: str, repo_root: Path = REPO_ROOT) -> "Layout":
+        """The default layout of run3 or run4."""
+        if run == "run3":
+            return cls(repo_root=repo_root, results=repo_root / "results" / "run3", wandb_dir=repo_root / "wandb")
+        if run == "run4":
+            return cls(
+                repo_root=repo_root,
+                results=repo_root / "results" / "run4",
+                ckpt_dir=Path("/workspace/ckpt/grpo-4b-run4"),
+                rft_dir=Path("/workspace/ckpt/rft-4b-run4/final"),
+                run2_adapter_dir=Path("/workspace/inputs/run3-adapter"),
+                wandb_dir=repo_root / "wandb",
+                remote_ckpt="checkpoints/grpo-4b-run4",
+                remote_rft="checkpoints/rft-4b-run4/final",
+                remote_results="results/run4",
+                run="run4",
+                prev_run="run3",
+                prev_remote_ckpt=RUN3_REMOTE_CKPT,
+                prev_result_files=RUN3_RESULT_FILES,
+            )
+        raise ValueError(f"Unknown run {run!r}. Use run3 or run4.")
+
+    @property
+    def best_dir(self) -> Path:
+        """Run 4's best mid-training adapter (`grpo.keep_best`)."""
+        return Path(self.ckpt_dir) / "best"
+
+    @property
+    def remote_best(self) -> str:
+        return f"{self.remote_ckpt}/best"
+
+    @classmethod
+    def from_env(cls, run: Optional[str] = None) -> "Layout":
+        """The layout of `run` (default: run3), with env overrides.
+
+        Overrides: RUNn_RESULTS and RUNn_CKPT for the run, and the previous
+        run's RUNm_ADAPTER for the start adapter (RUN2_ADAPTER for run 3,
+        RUN3_ADAPTER for run 4).
+        """
+        run = run or "run3"
+        lay = cls.for_run(run)
         env = os.environ
-        if env.get("RUN3_RESULTS"):
-            lay.results = Path(env["RUN3_RESULTS"])
-        if env.get("RUN3_CKPT"):
-            lay.ckpt_dir = Path(env["RUN3_CKPT"])
-        if env.get("RUN2_ADAPTER"):
-            lay.run2_adapter_dir = Path(env["RUN2_ADAPTER"])
+        up, prev = run.upper(), lay.prev_run.upper()
+        if env.get(f"{up}_RESULTS"):
+            lay.results = Path(env[f"{up}_RESULTS"])
+        if env.get(f"{up}_CKPT"):
+            lay.ckpt_dir = Path(env[f"{up}_CKPT"])
+        if env.get(f"{prev}_ADAPTER"):
+            lay.run2_adapter_dir = Path(env[f"{prev}_ADAPTER"])
         return lay
 
 
@@ -219,7 +288,7 @@ def group_remote_checkpoints(remote: dict[str, int], prefix: str) -> list[int]:
 
 
 def pick_run2_adapter(remote: dict[str, int], prefix: str = RUN2_REMOTE_CKPT) -> Optional[str]:
-    """Remote folder of the run-2 adapter: `final` if it exists, else the newest checkpoint with an adapter.
+    """Remote folder of a previous run's adapter: `final` if it exists, else the newest checkpoint with an adapter.
 
     Run 2 stopped at its time cap, so it has no `final`; its adapter is
     `checkpoint-52`, the one its post-training evals used.
@@ -270,6 +339,8 @@ def final_upload_map(lay: Layout) -> dict[str, Path]:
         add_tree(lay.ckpt_dir / "final", f"{lay.remote_ckpt}/final")
     if has_adapter(lay.rft_dir):
         add_tree(lay.rft_dir, lay.remote_rft)
+    if has_adapter(lay.best_dir):
+        add_tree(lay.best_dir, lay.remote_best)
     add_tree(lay.results, lay.remote_results)
     run_id = None
     try:
@@ -287,7 +358,7 @@ def final_upload_map(lay: Layout) -> dict[str, Path]:
 
 
 class Hub:
-    """The few Hugging Face operations run 3 needs, on one model repository."""
+    """The few Hugging Face operations a run needs, on one model repository."""
 
     def __init__(self, repo_id: str, token: Optional[str] = None):
         from huggingface_hub import HfApi
@@ -349,7 +420,7 @@ def sync_once(hub: Any, lay: Layout, state: SyncState) -> dict[str, Any]:
     if n is not None:
         log(f"uploading checkpoint-{n}")
         hub.upload_folder(lay.ckpt_dir / f"checkpoint-{n}", f"{lay.remote_ckpt}/checkpoint-{n}",
-                          f"run3: checkpoint-{n}")
+                          f"{lay.run}: checkpoint-{n}")
         write_synced(lay.results, n)
         did["checkpoint"] = n
 
@@ -362,9 +433,17 @@ def sync_once(hub: Any, lay: Layout, state: SyncState) -> dict[str, Any]:
         on_hub = hub.list_files(remote)
         if not all(f"{remote}/{f}" in on_hub for f in ADAPTER_FILES):
             log(f"uploading {name}")
-            hub.upload_folder(local, remote, f"run3: {name}")
+            hub.upload_folder(local, remote, f"{lay.run}: {name}")
         state.adapters.append(name)
         did["adapters"].append(name)
+
+    # The best mid-training adapter (run 4) changes during GRPO; upload each version once.
+    tag = best_tag(lay.best_dir)
+    if tag and tag not in state.adapters:
+        log(f"uploading the best adapter ({tag})")
+        hub.upload_folder(lay.best_dir, lay.remote_best, f"{lay.run}: {tag}")
+        state.adapters.append(tag)
+        did["adapters"].append(tag)
 
     scan = scan_files(lay.results)
     changed = changed_files(scan, state.manifest)
@@ -376,7 +455,7 @@ def sync_once(hub: Any, lay: Layout, state: SyncState) -> dict[str, Any]:
             except OSError:
                 continue  # removed since the scan
         if payload:
-            hub.upload_files(payload, f"run3: sync {len(payload)} files")
+            hub.upload_files(payload, f"{lay.run}: sync {len(payload)} files")
             for rel in changed:
                 state.manifest[rel] = list(scan[rel])
             did["files"] = len(payload)
@@ -384,8 +463,19 @@ def sync_once(hub: Any, lay: Layout, state: SyncState) -> dict[str, Any]:
     return did
 
 
+def best_tag(best_dir: Path) -> Optional[str]:
+    """`best-step-N` for a finished best adapter (run 4), or None."""
+    if not has_adapter(best_dir):
+        return None
+    try:
+        info = json.loads((Path(best_dir) / BEST_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    return f"best-step-{int(info.get('step', 0))}"
+
+
 def all_done(results: Path) -> bool:
-    from cua.run3_status import last_line
+    from cua.run_status import last_line
 
     return last_line(Path(results) / "run.log") == "ALL DONE"
 
@@ -448,40 +538,44 @@ def _download_tree(hub: Any, remote_files: Iterable[str], remote_root: str, loca
 def restore(hub: Any, lay: Layout) -> dict[str, Any]:
     """Brings a new pod to where the last synced state left off. Safe to run again.
 
-    - run-2 inputs: the adapter (required) and run 2's result files (optional);
-    - results/run3/, only when it has no `.phases` folder here;
+    - inputs from the previous run: its adapter (required) and some result
+      files (optional);
+    - results/runN/, only when it has no `.phases` folder here;
     - the newest synced GRPO checkpoint, only when there is no local one;
+    - the best adapter (run 4), when there is one on the Hub and none here;
     - the final and RFT adapters, when their phases are done.
 
-    With nothing on the Hub yet, it restores nothing for run 3, and GRPO starts
-    fresh from the run-2 adapter.
+    With nothing on the Hub yet, it restores nothing for this run, and GRPO
+    starts fresh from the previous run's adapter.
     """
     staging_root = Path(lay.ckpt_dir).parent / ".restore-tmp"
     did: dict[str, Any] = {}
+    prev, prev_up = lay.prev_run, lay.prev_run.upper()
 
-    # Run-2 adapter.
+    # The previous run's adapter.
     if not has_adapter(lay.run2_adapter_dir):
-        remote2 = hub.list_files(RUN2_REMOTE_CKPT)
-        folder = os.environ.get("RUN2_HF_PATH") or pick_run2_adapter(remote2)
+        remote2 = hub.list_files(lay.prev_remote_ckpt)
+        folder = os.environ.get(f"{prev_up}_HF_PATH") or pick_run2_adapter(remote2, lay.prev_remote_ckpt)
         if not folder:
-            raise SystemExit(f"No run-2 adapter under {RUN2_REMOTE_CKPT} on the Hub. Set RUN2_HF_PATH.")
-        log(f"downloading the run-2 adapter from {folder}")
+            raise SystemExit(f"No {prev} adapter under {lay.prev_remote_ckpt} on the Hub. Set {prev_up}_HF_PATH.")
+        log(f"downloading the {prev} adapter from {folder}")
         _download_tree(hub, [f"{folder}/{f}" for f in ADAPTER_FILES], folder, lay.run2_adapter_dir,
-                       staging_root / "run2")
-        did["run2_adapter"] = folder
-    # Run-2 result files: optional inputs with fallbacks in run3.sh.
-    remote_r2 = None
-    for rpath in RUN2_RESULT_FILES:
+                       staging_root / prev)
+        did[f"{prev}_adapter"] = folder
+    # The previous run's result files: optional inputs with fallbacks in the pipeline.
+    listings: dict[str, dict[str, int]] = {}
+    for rpath in lay.prev_result_files:
         local = lay.repo_root / rpath
         if local.exists():
             continue
-        if remote_r2 is None:
-            remote_r2 = hub.list_files("results/run2")
-        if rpath in remote_r2:
-            _download_tree(hub, [rpath], "results/run2", lay.repo_root / "results" / "run2", staging_root / "r2")
-            did.setdefault("run2_results", []).append(rpath)
+        top = "/".join(rpath.split("/")[:2])  # for example results/run3
+        if top not in listings:
+            listings[top] = hub.list_files(top)
+        if rpath in listings[top]:
+            _download_tree(hub, [rpath], top, lay.repo_root / top, staging_root / "prev")
+            did.setdefault(f"{prev}_results", []).append(rpath)
         else:
-            log(f"note: {rpath} isn't on the Hub; run3.sh falls back")
+            log(f"note: {rpath} isn't on the Hub; the pipeline falls back")
 
     # results/run3.
     if not (lay.results / ".phases").is_dir():
@@ -498,7 +592,7 @@ def restore(hub: Any, lay: Layout) -> dict[str, Any]:
             state.save(lay.results)
             did["results_files"] = len(rels)
         else:
-            log(f"nothing under {lay.remote_results} on the Hub yet; starting run 3 from scratch")
+            log(f"nothing under {lay.remote_results} on the Hub yet; starting {lay.run} from scratch")
 
     # The newest GRPO checkpoint.
     remote_ck = None
@@ -521,6 +615,14 @@ def restore(hub: Any, lay: Layout) -> dict[str, Any]:
         else:
             log("no synced GRPO checkpoint on the Hub; GRPO starts from its start adapter")
 
+    # The best mid-training adapter (run 4), so post_eval can still choose it.
+    if lay.run != "run3" and not has_adapter(lay.best_dir):
+        files = hub.list_files(lay.remote_best)
+        if all(f"{lay.remote_best}/{f}" in files for f in ADAPTER_FILES):
+            log(f"restoring {lay.remote_best}")
+            _download_tree(hub, list(files), lay.remote_best, lay.best_dir, staging_root / "best")
+            did.setdefault("adapters", []).append(lay.remote_best)
+
     # Final and RFT adapters, when their phase is done.
     markers = done_markers(lay.results)
     for marker, local, remote in (("grpo.done", lay.ckpt_dir / "final", f"{lay.remote_ckpt}/final"),
@@ -541,7 +643,7 @@ def restore(hub: Any, lay: Layout) -> dict[str, Any]:
 
 def remote_listing(hub: Any, lay: Layout) -> dict[str, int]:
     out: dict[str, int] = {}
-    for prefix in (lay.remote_ckpt, lay.remote_rft, lay.remote_results):
+    for prefix in (lay.remote_ckpt, lay.remote_rft, lay.remote_results):  # remote_best is under remote_ckpt
         out.update(hub.list_files(prefix))
     return out
 
@@ -554,7 +656,7 @@ def upload_final(hub: Any, lay: Layout, do_verify: bool = True, attempts: int = 
         todo = missing + mismatched
         log(f"attempt {attempt}: {len(local)} local files, {len(todo)} to upload")
         if todo:
-            hub.upload_files([(r, local[r]) for r in todo], "run3: final upload")
+            hub.upload_files([(r, local[r]) for r in todo], f"{lay.run}: final upload")
         if not do_verify:
             return True
         missing, mismatched = verify(final_upload_map(lay), remote_listing(hub, lay))
@@ -567,18 +669,19 @@ def upload_final(hub: Any, lay: Layout, do_verify: bool = True, attempts: int = 
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Sync run 3 with Hugging Face.")
+    parser = argparse.ArgumentParser(description="Sync a run (run3 or run4) with Hugging Face.")
+    parser.add_argument("--run", default=os.environ.get("CUA_RUN") or "run3", choices=("run3", "run4"))
     sub = parser.add_subparsers(dest="cmd", required=True)
     lp = sub.add_parser("loop", help="Sync until run.log ends with ALL DONE.")
     lp.add_argument("--interval", type=float, default=float(os.environ.get("SYNC_INTERVAL_S", "300")))
     lp.add_argument("--poll", type=float, default=20.0)
     sub.add_parser("once", help="One sync pass.")
-    sub.add_parser("restore", help="Restore run 3 on a new pod.")
+    sub.add_parser("restore", help="Restore the run on a new pod.")
     fp = sub.add_parser("final", help="Upload everything, optionally verify.")
     fp.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
 
-    lay = Layout.from_env()
+    lay = Layout.from_env(args.run)
     hub = hub_from_env()
     if args.cmd == "loop":
         sync_loop(hub, lay, interval=args.interval, poll=args.poll)
@@ -589,6 +692,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     elif args.cmd == "final":
         return 0 if upload_final(hub, lay, do_verify=args.verify) else 1
     return 0
+
+
+def upload_cli(run: str, argv: Optional[list[str]] = None) -> int:
+    """`scripts/upload_runN.py --final --verify`: upload everything, then check it.
+
+    `--final` first stops tmux session `runN-sync`, so two processes don't
+    commit at the same time. The last output line is `VERIFIED` when the check
+    passes, `UPLOADED` after an unverified upload, and `NOT VERIFIED` when the
+    check fails. The exit code is 0 only on success.
+    """
+    import subprocess
+
+    parser = argparse.ArgumentParser(description=f"Upload {run} to Hugging Face and verify it.")
+    parser.add_argument("--final", action="store_true", help="Upload everything that isn't on the Hub yet.")
+    parser.add_argument("--verify", action="store_true", help="Check every local file is on the Hub; exit 1 if not.")
+    args = parser.parse_args(argv)
+    if not args.final and not args.verify:
+        parser.error("pass --final, --verify, or both")
+
+    lay = Layout.from_env(run)
+    hub = hub_from_env()
+    if args.final:
+        try:
+            subprocess.run(["tmux", "kill-session", "-t", f"{run}-sync"], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass  # no tmux, or no session: nothing to stop
+        ok = upload_final(hub, lay, do_verify=args.verify)
+    else:
+        missing, mismatched = verify(final_upload_map(lay), remote_listing(hub, lay))
+        ok = not missing and not mismatched
+        log(f"{len(missing)} missing, {len(mismatched)} with another size")
+    print("VERIFIED" if ok and args.verify else ("UPLOADED" if ok else "NOT VERIFIED"))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

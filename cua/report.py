@@ -78,7 +78,39 @@ PRESETS: dict[str, dict[str, Any]] = {
         "SUBTITLE": "Run 3: GRPO on Track B (screenshot only, coordinate clicks), continued from the run-2 adapter. "
                     "Base vs run 2 vs run 3, all on Track B, paired on the same seeds.",
     },
+    # Run 4 (docs/PLAN_RUN4.md): Track B with 20 turns, a history window, and
+    # drag and double-click, continued from the run-3 adapter. "rft" is the
+    # run-3 adapter evaluated at run 4's settings.
+    "run4": {
+        "POOLS": {
+            "heldout": {"base": "base-heldout4", "rft": "run3-heldout4", "grpo": "run4-heldout4"},
+            "full": {"base": "base-full4", "rft": "run3-full4", "grpo": "run4-full4"},
+        },
+        "POOL_TITLES": {"heldout": "Held-out v2 (Track B, 20 turns)", "full": "Full suite (Track B, 20 turns)"},
+        "LABELS": {"base": "Base", "rft": "Run 3", "grpo": "Run 4"},
+        "GOAL_POINTS": 0.0,
+        "DELTA_REF": "rft",
+        "GIF_PAIR": ("rft", "grpo"),
+        "SUBTITLE": "Run 4: GRPO on Track B with 20 turns, a history window, and drag and double-click tools, "
+                    "continued from the run-3 adapter. Run 3 vs run 4 at run 4's settings, paired on the same seeds.",
+        # The journey table: (column title, results folder, {model: eval run name}).
+        "JOURNEY": [
+            ("Held-out v2, Track A, 8 turns (run 2's evals)", "run2",
+             {"Base": "base-heldout2", "Run 1": "run1-heldout2", "Run 2": "run2-heldout2"}),
+            ("Held-out v2, Track B, 10 turns (run 3's evals)", "run3",
+             {"Base": "base-heldout3", "Run 2": "run2-heldout3", "Run 3": "run3-heldout3"}),
+            ("Held-out v2, Track B, 20 turns, drag tools (run 4's evals)", "run4",
+             {"Base": "base-heldout4", "Run 3": "run3-heldout4", "Run 4": "run4-heldout4"}),
+            ("Full suite, Track B, 20 turns, drag tools (run 4's evals)", "run4",
+             {"Base": "base-full4", "Run 3": "run3-full4", "Run 4": "run4-full4"}),
+        ],
+        "RUN4_GOALS": True,
+    },
 }
+JOURNEY: Optional[list] = None
+RUN4_GOALS = False
+JOURNEY_MODELS = ["Base", "Run 1", "Run 2", "Run 3", "Run 4"]
+RUN3_HELDOUT_RESULT = 0.715  # run 3's held-out v2 success (results/run3/compare/heldout3-run3-vs-run2.md)
 
 
 def apply_preset(name: Optional[str]) -> None:
@@ -217,6 +249,9 @@ def headline_section(summaries: dict[str, Optional[dict]]) -> str:
     note = (
         f"<p class=\"small muted\">Greedy decoding on held-out seeds. Goal: at least +{GOAL_POINTS:.0f} points "
         f"over {esc(LABELS[DELTA_REF])} on the training pool, and no drop on the held-out pool.</p>"
+    ) if "train" in POOLS else (
+        f"<p class=\"small muted\">Greedy decoding on the eval seeds, paired across models. Deltas are against "
+        f"{esc(LABELS[DELTA_REF])}. The success criteria are in the section above.</p>"
     )
     return "<h2>Headline numbers</h2>" + note + "".join(parts)
 
@@ -226,7 +261,6 @@ def per_task_chart(pool: str, summaries: dict[str, Optional[dict]]) -> str:
     import matplotlib
 
     matplotlib.use("Agg")  # no display on the pod
-    import matplotlib.pyplot as plt
 
     present = {k: summaries[n] for k, n in POOLS[pool].items() if summaries.get(n)}
     if not present:
@@ -234,6 +268,16 @@ def per_task_chart(pool: str, summaries: dict[str, Optional[dict]]) -> str:
     tasks = sorted({t for s in present.values() for t in s.get("per_task", {})})
     if not tasks:
         return not_run("no per-task data")
+    # The full suite has over 100 tasks: draw one chart per 30, so each stays readable.
+    chunk = 30
+    if len(tasks) > chunk:
+        return "".join(_task_bars(pool, present, tasks[i : i + chunk], f" ({i // chunk + 1} of {-(-len(tasks) // chunk)})")
+                       for i in range(0, len(tasks), chunk))
+    return _task_bars(pool, present, tasks, "")
+
+
+def _task_bars(pool: str, present: dict, tasks: list[str], suffix: str) -> str:
+    import matplotlib.pyplot as plt
 
     width = 0.8 / len(present)
     fig, ax = plt.subplots(figsize=(max(6, 0.9 * len(tasks) + 2), 4.2))
@@ -245,11 +289,11 @@ def per_task_chart(pool: str, summaries: dict[str, Optional[dict]]) -> str:
     ax.set_xticklabels(tasks, rotation=40, ha="right", fontsize=8)
     ax.set_ylabel("Greedy success (%)")
     ax.set_ylim(0, 105)
-    ax.set_title(f"{POOL_TITLES[pool]}: success per task")
+    ax.set_title(f"{POOL_TITLES[pool]}: success per task{suffix}")
     ax.legend(frameon=False)
     ax.spines[["top", "right"]].set_visible(False)
     ax.grid(axis="y", alpha=0.25)
-    return img_tag(png_b64(fig), f"Per-task success, {POOL_TITLES[pool]}")
+    return img_tag(png_b64(fig), f"Per-task success, {POOL_TITLES[pool]}{suffix}")
 
 
 def _series(rows: list[dict], key: str) -> tuple[list[float], list[float]]:
@@ -433,6 +477,116 @@ def failure_section(summaries: dict[str, Optional[dict]]) -> str:
     return "".join(parts)
 
 
+def journey_section(results_root: Path) -> str:
+    """Base, run 1, run 2, run 3, and run 4 on held-out v2 and the full suite, where measured.
+
+    Each column is one eval setting, read from that run's own results folder.
+    Numbers in different columns aren't comparable (other tools, turns, or
+    track); numbers in one column are (same tasks, seeds, and settings).
+    """
+    if not JOURNEY:
+        return ""
+    head = "".join(f"<th>{esc(title)}</th>" for title, _, _ in JOURNEY)
+    rows = []
+    for model in JOURNEY_MODELS:
+        cells = []
+        for _title, run, names in JOURNEY:
+            name = names.get(model)
+            s = _read_json(results_root / run / "eval" / name / "summary.json") if name else None
+            rate = s.get("overall_success") if s else None
+            if rate is None:
+                cells.append(f'<td class="muted">{"not run" if name else "n/a"}</td>')
+            else:
+                cells.append(f"<td>{pct(rate)} <span class=\"small muted\">({s.get('n_episodes', '?')} ep.)</span></td>")
+        rows.append(f"<tr><td>{esc(model)}</td>{''.join(cells)}</tr>")
+    note = ('<p class="small muted">Greedy success, every task weighted equally. Compare numbers within a column: '
+            "each column is one setting (track, turn limit, tools), and the columns differ. \"n/a\" means that "
+            "run never measured the model in that setting.</p>")
+    return (f"<h2>The journey: base to run 4</h2>{note}<div class=\"scroll\"><table><thead><tr><th>Model</th>{head}"
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def run4_goals(root: Path, task_lists: Optional[dict] = None) -> list[tuple[str, Optional[bool], str]]:
+    """Run 4's success criteria (docs/PLAN_RUN4.md) as (criterion, met or None, evidence)."""
+    from cua.config import load_tasks
+
+    spec = load_tasks()
+    lists = task_lists or {"turn_limited": spec.run4_turn_limited,
+                           "new_action": spec.train_candidates_run4_new_action}
+    ev = root / "eval"
+    goals: list[tuple[str, Optional[bool], str]] = []
+
+    held = _read_json(ev / "run4-heldout4" / "summary.json")
+    rate = held.get("overall_success") if held else None
+    goals.append((f"Held-out v2 above run 3's {pct(RUN3_HELDOUT_RESULT)}", None if rate is None else rate > RUN3_HELDOUT_RESULT,
+                  f"run 4: {pct(rate)}"))
+
+    full4 = _read_json(ev / "run4-full4" / "summary.json")
+    full3 = _read_json(ev / "run3-full4" / "summary.json")
+
+    def mean_over(s: Optional[dict], tasks: list[str]) -> Optional[float]:
+        if not s:
+            return None
+        vals = [(s.get("per_task", {}).get(t) or {}).get("success_rate") for t in tasks]
+        vals = [v for v in vals if v is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    tl4, tl3 = mean_over(full4, lists["turn_limited"]), mean_over(full3, lists["turn_limited"])
+    goals.append(("Tasks that ran out of turns at 10 turns: at least 30% on average", None if tl4 is None else tl4 >= 0.30,
+                  f"run 4: {pct(tl4)}, run 3 at run 4's settings: {pct(tl3)}"))
+
+    solved = None
+    if full4:
+        solved = [t for t in lists["new_action"] if ((full4.get("per_task", {}).get(t) or {}).get("success_rate") or 0) > 0]
+    goals.append(("Some success on drag tasks", None if solved is None else bool(solved),
+                  "none measured" if solved is None else (f"{len(solved)} tasks above 0%: {', '.join(solved)}" if solved else "0 tasks above 0%")))
+
+    cmp_full = _read_json(root / "compare" / "full4-run4-vs-run3.json")
+    if cmp_full and cmp_full.get("overall"):
+        o = cmp_full["overall"]
+        goals.append(("Full suite up against run 3 (paired 95% interval above 0)", o["ci95"][0] > 0,
+                      f"{100 * o['a']:.1f}% to {100 * o['b']:.1f}%, {100 * o['diff']:+.1f} points "
+                      f"({100 * o['ci95'][0]:+.1f} to {100 * o['ci95'][1]:+.1f})"))
+    else:
+        goals.append(("Full suite up against run 3 (paired 95% interval above 0)", None, "not compared"))
+
+    rows = []
+    for path in sorted((root / "train").glob("*/metrics.jsonl")):
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("kind", "train") == "train" and "time/rollout_s" in row:
+                rows.append(row)
+    if rows:
+        worst_grad = max(float(r.get("grad_norm_max", r.get("grad_norm", 0)) or 0) for r in rows)
+        worst_kl = max(float(r.get("train/approx_kl", 0) or 0) for r in rows)
+        goals.append(("No ratio blow-ups (every step: gradient norm at most 10, approx. KL at most 1)",
+                      worst_grad <= 10 and worst_kl <= 1,
+                      f"worst gradient norm {worst_grad:.2f}, worst approx. KL {worst_kl:.3f} over {len(rows)} steps"))
+    else:
+        goals.append(("No ratio blow-ups", None, "no training metrics"))
+    return goals
+
+
+def goals_section(root: Path) -> str:
+    if not RUN4_GOALS:
+        return ""
+    rows = []
+    for name, met, evidence in run4_goals(root):
+        label, cls = ("not measured", "muted") if met is None else (("met", "good") if met else ("not met", "bad"))
+        rows.append(f'<tr><td>{esc(name)}</td><td class="{cls}">{label}</td><td>{esc(evidence)}</td></tr>')
+    choice = _read_json(root / "adapter_choice.json")
+    note = ""
+    if choice:
+        note = (f'<p class="small muted">Adapter reported: {esc(choice.get("choice"))} ({esc(choice.get("adapter"))}). '
+                f'Final adapter on the selection seeds: {pct(choice.get("final_eval_success"))}; best mid-training '
+                f'checkpoint: {pct((choice.get("best") or {}).get("eval_success"))} at step {esc((choice.get("best") or {}).get("step", "n/a"))}.</p>')
+    return ("<h2>Run 4 success criteria</h2><div class=\"scroll\"><table><thead><tr><th>Criterion</th><th>Result</th>"
+            f"<th>Evidence</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>{note}")
+
+
 # ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
@@ -471,6 +625,8 @@ def build_report(cfg: Any, out_dir: Optional[Path] = None) -> Path:
 
     summaries = load_summaries(eval_dir)
     body = [
+        goals_section(root),
+        journey_section(root.parent),
         headline_section(summaries),
         "<h2>Success per task</h2>",
         *[f"<h3>{POOL_TITLES[p]}</h3>{per_task_chart(p, summaries)}" for p in POOLS],
@@ -497,7 +653,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Build results/report/index.html from eval and training outputs.")
     add_config_args(parser, "configs/eval.yaml")
     parser.add_argument("--out", default=None, help="Output directory. Default: results/report.")
-    parser.add_argument("--preset", default=None, help='Run names and labels to use: omit for run 1, or "run2" or "run3".')
+    parser.add_argument("--preset", default=None, help='Run names and labels to use: omit for run 1, or "run2", "run3", or "run4".')
     args = parser.parse_args(argv)
     apply_preset(args.preset)
     cfg = config_from_args(args)

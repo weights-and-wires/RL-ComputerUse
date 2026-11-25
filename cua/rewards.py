@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 
-from cua.config import Config
+from cua.config import Config, turn_limit
 from cua.types import Episode, RewardBreakdown
 
 # Same labels as Episode.failure_mode(), minus "crashed" (crashed episodes are
@@ -23,7 +23,9 @@ from cua.types import Episode, RewardBreakdown
 FAILURE_MODES = ("success", "format_error", "ran_out_of_turns", "invalid_action", "wrong_action")
 
 
-def reward_from_counts(success: bool, num_format_errors: int, turns_used: int, cfg: Config) -> RewardBreakdown:
+def reward_from_counts(
+    success: bool, num_format_errors: int, turns_used: int, cfg: Config, max_turns: int | None = None
+) -> RewardBreakdown:
     """Compute the reward from three numbers. Both trainers call this.
 
     Args:
@@ -31,12 +33,14 @@ def reward_from_counts(success: bool, num_format_errors: int, turns_used: int, c
         num_format_errors: Turns whose response had a format error.
         turns_used: Turns the agent took.
         cfg: Config with `rewards.*` and `env.max_turns`.
+        max_turns: The episode's turn limit, when it differs from
+            `env.max_turns` (run 4's per-task budgets).
 
     Returns:
         A `RewardBreakdown`. `format_penalty` is zero or negative.
     """
     rewards = cfg.rewards
-    max_turns = max(int(cfg.env.max_turns), 1)
+    max_turns = max(int(max_turns if max_turns is not None else cfg.env.max_turns), 1)
 
     penalty = -min(max(num_format_errors, 0) * float(rewards.format_penalty), float(rewards.format_penalty_cap))
 
@@ -61,7 +65,7 @@ def compute_reward(ep: Episode, cfg: Config) -> RewardBreakdown:
     """
     if ep.crashed:
         return RewardBreakdown()
-    return reward_from_counts(ep.success, ep.num_format_errors, ep.num_turns, cfg)
+    return reward_from_counts(ep.success, ep.num_format_errors, ep.num_turns, cfg, turn_limit(cfg, ep.task))
 
 
 def _mean(values: list[float]) -> float:

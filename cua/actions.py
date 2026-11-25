@@ -166,29 +166,75 @@ def keyboard_press(key: str) -> str:
     raise NotImplementedError("Tool stubs only describe the interface.")
 
 
+def double_click(coordinate: list[int]) -> str:
+    """Double-click at a position on the screenshot.
+
+    Args:
+        coordinate: The position as [x, y], each from 0 to 1000, in the same
+            units as mouse_click.
+
+    Returns:
+        The new screenshot.
+    """
+    raise NotImplementedError("Tool stubs only describe the interface.")
+
+
+def left_click_drag(start_coordinate: list[int], end_coordinate: list[int]) -> str:
+    """Press the left mouse button at one position, move to another, and release it.
+
+    Use it to drag items, move sliders, and select text.
+
+    Args:
+        start_coordinate: Where the drag starts, as [x, y], each from 0 to 1000.
+        end_coordinate: Where the drag ends, as [x, y], each from 0 to 1000.
+
+    Returns:
+        The new screenshot.
+    """
+    raise NotImplementedError("Tool stubs only describe the interface.")
+
+
 TRACK_A_TOOLS: list[Callable] = [click, fill, select_option, press, scroll, noop]
 TRACK_B_TOOLS: list[Callable] = [mouse_click, keyboard_type, keyboard_press, scroll, noop]
+# Run 4 adds these to Track B when `env.track_b_extra_tools` is true. Their
+# names match Qwen3-VL's own computer-use actions (double_click,
+# left_click_drag), so the model's prior on the names helps.
+TRACK_B_EXTRA_TOOLS: list[Callable] = [double_click, left_click_drag]
 
 
-def tools_for(track: Track) -> list[Callable]:
-    """Return the tool stubs for a track ("A" or "B")."""
+def tools_for(track: Track, extended: bool = False) -> list[Callable]:
+    """Return the tool stubs for a track ("A" or "B").
+
+    Args:
+        track: "A" or "B".
+        extended: Add `TRACK_B_EXTRA_TOOLS` (Track B only). Run 4 sets it
+            through `env.track_b_extra_tools`.
+    """
     if track == "A":
         return list(TRACK_A_TOOLS)
     if track == "B":
-        return list(TRACK_B_TOOLS)
+        return list(TRACK_B_TOOLS) + (list(TRACK_B_EXTRA_TOOLS) if extended else [])
     raise ValueError(f"Unknown track {track!r}. Use 'A' or 'B'.")
 
 
-def tool_schemas(track: Track) -> list[dict]:
+def extended_tools(cfg: Any) -> bool:
+    """True when the config turns on the extra Track B tools (`env.track_b_extra_tools`)."""
+    try:
+        return bool((cfg.get("env") or {}).get("track_b_extra_tools", False))
+    except AttributeError:
+        return False
+
+
+def tool_schemas(track: Track, extended: bool = False) -> list[dict]:
     """Return JSON schemas for a track's tools, ready for `tools=` in a chat template."""
     # Lazy import keeps `import cua.actions` fast and usable without transformers.
     from transformers.utils import get_json_schema
 
-    return [get_json_schema(fn) for fn in tools_for(track)]
+    return [get_json_schema(fn) for fn in tools_for(track, extended)]
 
 
-def _tool_names(track: Track) -> list[str]:
-    return [fn.__name__ for fn in tools_for(track)]
+def _tool_names(track: Track, extended: bool = False) -> list[str]:
+    return [fn.__name__ for fn in tools_for(track, extended)]
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +311,23 @@ def _normalize_click_args(args: dict) -> dict:
     return args
 
 
+def _normalize_drag_args(args: dict) -> dict:
+    """Accept the drag argument shapes the model is likely to produce.
+
+    The schema is `{"start_coordinate": [x, y], "end_coordinate": [x, y]}`.
+    Qwen3-VL's mobile `swipe` action uses `coordinate` (start) and
+    `coordinate2` (end), and Qwen's computer-use `left_click_drag` names the
+    end point `coordinate`. Map those shapes onto the schema. A lone
+    `coordinate` (Qwen's drag from the current cursor) has no start point, so
+    it stays invalid and the error message asks for both points.
+    """
+    if {"coordinate", "coordinate2"} == set(args):
+        return {"start_coordinate": args["coordinate"], "end_coordinate": args["coordinate2"]}
+    if {"start_coordinate", "coordinate"} == set(args):
+        return {"start_coordinate": args["start_coordinate"], "end_coordinate": args["coordinate"]}
+    return args
+
+
 # Argument name -> validator, in the order the BrowserGym call uses them.
 _ARG_SPECS: dict[str, list[tuple[str, Callable[[Any], Any]]]] = {
     "click": [("bid", _as_bid)],
@@ -274,6 +337,8 @@ _ARG_SPECS: dict[str, list[tuple[str, Callable[[Any], Any]]]] = {
     "scroll": [("direction", _as_direction)],
     "noop": [],
     "mouse_click": [("coordinate", _as_coord_pair)],
+    "double_click": [("coordinate", _as_coord_pair)],
+    "left_click_drag": [("start_coordinate", _as_coord_pair), ("end_coordinate", _as_coord_pair)],
     "keyboard_type": [("text", _as_text)],
     "keyboard_press": [("key", _as_nonempty_text)],
 }
@@ -294,7 +359,9 @@ def _normalized_to_pixel(value: float, size: int) -> int:
     return min(max(round(value / 1000 * size), 0), size - 1)
 
 
-def render_action(name: str, args: dict, track: Track, screen_size: tuple[int, int]) -> str:
+def render_action(
+    name: str, args: dict, track: Track, screen_size: tuple[int, int], extended: bool = False
+) -> str:
     """Validate a tool call and build the BrowserGym action string.
 
     Args:
@@ -303,15 +370,17 @@ def render_action(name: str, args: dict, track: Track, screen_size: tuple[int, i
         track: "A" (element IDs) or "B" (coordinates).
         screen_size: The raw screenshot size as (width, height). Track B uses
             it to turn 0-1000 coordinates into pixels.
+        extended: Accept the extra Track B tools (double_click, left_click_drag).
 
     Returns:
-        An action string such as `click('12')` or `mouse_click(249, 160)`.
+        An action string such as `click('12')`, `mouse_click(249, 160)`,
+        `mouse_dblclick(249, 160)`, or `mouse_drag_and_drop(10, 20, 300, 20)`.
 
     Raises:
         ActionError: If the tool is unknown, belongs to the other track, or has
             missing, extra, or badly typed arguments.
     """
-    available = _tool_names(track)
+    available = _tool_names(track, extended)
     if not isinstance(name, str) or name not in available:
         raise ActionError(f"Unknown tool {name!r}. Available tools: {', '.join(available)}.")
     if args is None:
@@ -319,8 +388,10 @@ def render_action(name: str, args: dict, track: Track, screen_size: tuple[int, i
     if not isinstance(args, dict):
         raise ActionError(f"The arguments for {name} must be a JSON object.")
 
-    if name == "mouse_click":
+    if name in ("mouse_click", "double_click"):
         args = _normalize_click_args(args)
+    elif name == "left_click_drag":
+        args = _normalize_drag_args(args)
     spec = _ARG_SPECS[name]
     expected = [arg for arg, _ in spec]
     extra = [key for key in args if key not in expected]
@@ -355,14 +426,19 @@ def render_action(name: str, args: dict, track: Track, screen_size: tuple[int, i
         return f"keyboard_type({_q(values['text'])})"
     if name == "keyboard_press":
         return f"keyboard_press({_q(values['key'])})"
-    if name == "mouse_click":
+    if name in ("mouse_click", "double_click", "left_click_drag"):
         width, height = screen_size
         if width <= 0 or height <= 0:
             raise ActionError("The screenshot size is unknown, so the click position cannot be mapped.")
-        x, y = values["coordinate"]
-        px = _normalized_to_pixel(x, width)
-        py = _normalized_to_pixel(y, height)
-        return f"mouse_click({px}, {py})"
+
+        def pixel(pair: tuple[float, float]) -> str:
+            return f"{_normalized_to_pixel(pair[0], width)}, {_normalized_to_pixel(pair[1], height)}"
+
+        if name == "mouse_click":
+            return f"mouse_click({pixel(values['coordinate'])})"
+        if name == "double_click":
+            return f"mouse_dblclick({pixel(values['coordinate'])})"
+        return f"mouse_drag_and_drop({pixel(values['start_coordinate'])}, {pixel(values['end_coordinate'])})"
     raise ActionError(f"Unknown tool {name!r}.")  # Unreachable: _ARG_SPECS covers all tools.
 
 
@@ -426,7 +502,7 @@ def _split_tool_call(text: str) -> tuple[str, str | None]:
     return reasoning, rest[:cut]
 
 
-def _parse(text: str, track: Track, screen_size: tuple[int, int]) -> ParsedAction:
+def _parse(text: str, track: Track, screen_size: tuple[int, int], extended: bool = False) -> ParsedAction:
     reasoning, body = _split_tool_call(text)
     if body is None:
         return ParsedAction(
@@ -462,7 +538,7 @@ def _parse(text: str, track: Track, screen_size: tuple[int, int]) -> ParsedActio
             args = {}
 
     try:
-        action = render_action(name, args, track, screen_size)
+        action = render_action(name, args, track, screen_size, extended)
     except ActionError as exc:
         # Bad arguments or unknown tool: the episode continues, and the error
         # text goes back to the model as the tool result.
@@ -477,7 +553,9 @@ def _parse(text: str, track: Track, screen_size: tuple[int, int]) -> ParsedActio
     return ParsedAction(action=action, tool_name=name, tool_args=dict(args), reasoning=reasoning)
 
 
-def parse_response(text: str, track: Track, screen_size: tuple[int, int]) -> ParsedAction:
+def parse_response(
+    text: str, track: Track, screen_size: tuple[int, int], extended: bool = False
+) -> ParsedAction:
     """Parse raw model text into a `ParsedAction`. This function never raises.
 
     Rules:
@@ -493,12 +571,13 @@ def parse_response(text: str, track: Track, screen_size: tuple[int, int]) -> Par
         text: The raw generated text for one turn.
         track: "A" or "B".
         screen_size: The raw screenshot size as (width, height).
+        extended: Accept the extra Track B tools (double_click, left_click_drag).
 
     Returns:
         A `ParsedAction`. Check `format_error` first, then `action`.
     """
     try:
-        return _parse(text if isinstance(text, str) else "", track, screen_size)
+        return _parse(text if isinstance(text, str) else "", track, screen_size, extended)
     except Exception as exc:  # noqa: BLE001  (the contract says: never raise)
         return ParsedAction(
             action=None,

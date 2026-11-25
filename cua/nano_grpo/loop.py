@@ -238,35 +238,91 @@ def disable_dropout(model: torch.nn.Module) -> None:
             module.p = 0.0
 
 
+def sequence_items(items: list[tuple[Episode, float]]) -> list[tuple[Episode, float, int, list[dict]]]:
+    """Expands (episode, advantage) pairs into one training sequence per conversation.
+
+    Without a history window an episode is one conversation. With one (run 4,
+    `env.context_window_turns`), each segment is its own sequence and shares
+    the episode's advantage. Returns (episode, advantage, segment, messages).
+    """
+    return [(ep, adv, ci, conv) for ep, adv in items for ci, conv in enumerate(ep.conversations())]
+
+
+def sampler_turns(ep: Episode, segment: int) -> tuple[list[list[float]], list[str]]:
+    """vLLM's per-token log-probs and finish reasons for the turns of one segment."""
+    turns = ep.turns_in(segment)
+    return [list(t.generation.logprobs) for t in turns], [t.generation.finish_reason for t in turns]
+
+
+def split_by_episode(seqs: list, updates: int) -> list[list]:
+    """Shuffles episodes and deals them round-robin into `updates` minibatches.
+
+    All sequences of one episode go to the same minibatch, so each optimizer
+    step sees whole episodes.
+    """
+    order: list[int] = []
+    by_ep: dict[int, list] = {}
+    for item in seqs:
+        key = id(item[0])
+        if key not in by_ep:
+            by_ep[key] = []
+            order.append(key)
+        by_ep[key].append(item)
+    random.shuffle(order)
+    shards = [order[i::updates] for i in range(updates)]
+    return [[item for key in shard for item in by_ep[key]] for shard in shards]
+
+
 def train_phase(
     model, processor, optimizer, scheduler, items: list[tuple[Episode, float]],
     cfg: Config, tools: list[dict], micro_bs: int,
 ) -> dict[str, float]:
     """Runs `updates_per_step` optimizer steps over the training items.
 
-    Returns averaged loss metrics, the mean gradient norm, and the sampler
-    mismatch diagnostic.
+    Each conversation of an episode is one sequence (see `sequence_items`).
+    With `grpo.sampler_check` set (run 4), a no-grad pass first scores every
+    sequence, lines its log-probs up with vLLM's, drops episodes that don't
+    line up or differ too much, and builds truncated importance-sampling
+    weights. `grpo.ratio_cap` adds the dual-clip bound to the PPO loss.
+
+    Returns averaged loss metrics, gradient norms, and the sampler-mismatch
+    metrics.
     """
     g = cfg.grpo
     device = next(p.device for p in model.parameters())
     updates = int(g.updates_per_step)
-    # The most assistant tokens one episode can contain: every turn at its cap.
-    max_tokens_norm = cfg.env.max_turns * cfg.generation.max_new_tokens
+    # The divisor of dr_grpo. By default, the most assistant tokens one episode
+    # can contain. Run 4 pins it to run 3's value (10 turns x 160 tokens), so
+    # doubling max_turns doesn't halve the gradient scale.
+    max_tokens_norm = float(g.get("max_tokens_norm") or cfg.env.max_turns * cfg.generation.max_new_tokens)
+    ratio_cap = float(g.ratio_cap) if g.get("ratio_cap") else None
+    check = g.get("sampler_check") or {}
+    tis_cap = float(check["tis_cap"]) if check.get("tis_cap") else None
+    drop_threshold = check.get("max_mean_abs_diff")
+    drop_threshold = float(drop_threshold) if drop_threshold is not None else None
+    drop_unaligned = bool(check.get("drop_unaligned", False))
+    max_drop_frac = float(check.get("max_drop_frac", 0.25))
+    checks_on = bool(check.get("enabled", bool(check)))
     params = optimizer.param_groups[0]["params"]
     model.train()  # needed for gradient checkpointing; dropout is already off
 
-    token_cache: dict[int, dict] = {}  # tokenizing renders chat text and resizes images: do it once
+    seqs = sequence_items(items)
+    token_cache: dict[tuple[int, int], dict] = {}  # tokenizing renders chat text and resizes images: do it once
 
-    def tok(ep: Episode) -> dict:
-        if id(ep) not in token_cache:
-            token_cache[id(ep)] = tokenize_episode(processor, ep.messages, tools)
-        return token_cache[id(ep)]
+    def key(item) -> tuple[int, int]:
+        return (id(item[0]), item[2])
+
+    def tok(item) -> dict:
+        k = key(item)
+        if k not in token_cache:
+            token_cache[k] = tokenize_episode(processor, item[3], tools)
+        return token_cache[k]
 
     assistant_only = bool(g.get("assistant_only_logits", True))
 
-    def forward(batch: list[tuple[Episode, float]]) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    def forward(batch: list) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """One forward pass over whole conversations; returns log-probs and the loss mask."""
-        b = collate([tok(ep) for ep, _ in batch], device)
+        b = collate([tok(item) for item in batch], device)
         # The mask is 1 only on assistant tokens: the model did not write the
         # screenshots or page text, so training on them would be meaningless.
         mask = b["assistant_mask"].float()
@@ -292,70 +348,105 @@ def train_phase(
     # use new_logp.detach() inside the loss (ratio is exactly 1, gradient is
     # still correct). With more updates, the second minibatch is trained on
     # weights that already moved once, so we need a frozen snapshot first.
+    # The sampler checks need the same pass, so they turn it on too.
     #
-    # Why HF log-probs and not vLLM's? vLLM and PyTorch use different kernels and
-    # batching, so their log-probs differ by small numerical noise even for the
-    # same weights. A ratio built from one vLLM number and one PyTorch number
-    # would be noisy, and clipping would trigger on noise. Using the same code
-    # for both sides cancels that noise. We still log the vLLM difference below.
-    old: dict[int, torch.Tensor] = {}
-    if updates > 1:
+    # Why HF log-probs and not vLLM's as "old"? vLLM and PyTorch use different
+    # kernels and batching, so their log-probs differ by numerical noise even
+    # for the same weights. A ratio built from one vLLM number and one PyTorch
+    # number would be noisy, and clipping would trigger on noise. Using the
+    # same code for both sides cancels that noise. The vLLM gap is handled
+    # separately (sampler checks below) and always logged.
+    need_old = updates > 1 or checks_on
+    old: dict[tuple[int, int], torch.Tensor] = {}
+    sampler_lp: dict[tuple[int, int], torch.Tensor] = {}
+    seq_diffs: list[float] = []
+    num_unaligned = 0
+    drop_metrics: dict[str, float] = {}
+    if need_old:
+        ep_diff: dict[int, float] = {}
+        ep_aligned: dict[int, bool] = {}
         with torch.no_grad():
-            for mb in chunks(items, micro_bs):
-                lp, _, b = forward(mb)
-                for j, (ep, _) in enumerate(mb):
+            for mb in chunks(seqs, micro_bs):
+                lp, mask_b, b = forward(mb)
+                for j, item in enumerate(mb):
                     n = int(b["attention_mask"][j].sum())
-                    old[id(ep)] = lp[j, :n].detach()
+                    row_lp = lp[j, :n].detach()
+                    old[key(item)] = row_lp
+                    mask_row = [int(x) for x in mask_b[j, :n].tolist()]
+                    values, ok = L.align_sampler_logprobs(mask_row, *sampler_turns(item[0], item[2]))
+                    sampler_lp[key(item)] = torch.tensor(values, dtype=torch.float32, device=device)
+                    diff = L.mean_abs_diff(row_lp.float().cpu().tolist(), values, mask_row)
+                    if diff == diff:
+                        seq_diffs.append(diff)
+                    num_unaligned += int(not ok)
+                    e = id(item[0])
+                    prev = ep_diff.get(e, float("nan"))
+                    ep_diff[e] = diff if prev != prev else (max(prev, diff) if diff == diff else prev)
+                    ep_aligned[e] = ep_aligned.get(e, True) and ok
+        if checks_on:
+            aligned_for_drop = ep_aligned if drop_unaligned else {e: True for e in ep_diff}
+            dropped, drop_metrics = L.filter_mismatched(ep_diff, aligned_for_drop, drop_threshold, max_drop_frac)
+            if dropped:
+                log(f"sampler check: leaving out {len(dropped)} of {len(ep_diff)} episodes "
+                    f"(unaligned or mean |logp diff| > {drop_threshold})")
+                seqs = [item for item in seqs if id(item[0]) not in dropped]
 
-    items = list(items)
-    random.shuffle(items)
-    minibatches = [items[i::updates] for i in range(updates)]  # round-robin split
+    minibatches = split_by_episode(seqs, updates)
 
     all_metrics: list[dict[str, float]] = []
     grad_norms: list[float] = []
     loss_values: list[float] = []
-    mismatches: list[float] = []
-    num_length_skips = 0
     first = True
 
     for shard in minibatches:
         if not shard:
             continue
         optimizer.zero_grad(set_to_none=True)
-        total_seqs = len(shard)
-        total_tokens = float(sum(int(torch.as_tensor(tok(ep)["assistant_mask"]).sum()) for ep, _ in shard))
+        total_eps = len({id(item[0]) for item in shard})
+        total_tokens = float(sum(int(torch.as_tensor(tok(item)["assistant_mask"]).sum()) for item in shard))
         step_loss = 0.0
         for mb in chunks(shard, micro_bs):
             new_lp, mask, b = forward(mb)
-            adv = torch.tensor([a for _, a in mb], device=device, dtype=torch.float32)
-            if updates > 1:
+            adv = torch.tensor([item[1] for item in mb], device=device, dtype=torch.float32)
+            if need_old:
                 old_lp = torch.zeros_like(new_lp)
-                for j, (ep, _) in enumerate(mb):
-                    o = old[id(ep)]
+                for j, item in enumerate(mb):
+                    o = old[key(item)]
                     old_lp[j, : o.shape[0]] = o
             else:
                 old_lp = new_lp.detach()
+            weights = None
+            tis_m: dict[str, float] = {}
+            if tis_cap is not None and checks_on and sampler_lp:
+                s_lp = torch.full_like(new_lp, float("nan"))
+                for j, item in enumerate(mb):
+                    s = sampler_lp[key(item)]
+                    s_lp[j, : s.shape[0]] = s
+                weights, tis_m = L.tis_weights(old_lp, s_lp, mask, tis_cap)
             loss, m = L.clipped_pg_loss(
-                new_lp, old_lp, adv, mask, g.epsilon, g.epsilon_high, g.loss_type, max_tokens_norm
+                new_lp, old_lp, adv, mask, g.epsilon, g.epsilon_high, g.loss_type, max_tokens_norm,
+                ratio_cap=ratio_cap, is_weights=weights,
             )
+            m.update(tis_m)
             # Gradient accumulation: scale so the sum over micro-batches equals
             # the loss over the whole minibatch (see loss.microbatch_weight).
-            weight = L.microbatch_weight(g.loss_type, mask.sum().item(), total_tokens, len(mb), total_seqs)
+            # The sequence share is taken over episodes, so an episode split
+            # into segments weighs the same as one that isn't.
+            weight = L.microbatch_weight(g.loss_type, mask.sum().item(), total_tokens, len(mb), total_eps)
             (loss * weight).backward()
             step_loss += loss.item() * weight
             all_metrics.append(m)
 
-            if first:  # sampler-mismatch diagnostic, first micro-batch only
+            if first and not need_old:  # sampler-mismatch diagnostic, first micro-batch only
                 first = False
-                for j, (ep, _) in enumerate(mb):
-                    mine = new_lp[j][mask[j] > 0].detach().float().cpu()
-                    theirs = torch.tensor([x for t in ep.turns for x in t.generation.logprobs])
-                    # Both lists hold assistant tokens in conversation order. They
-                    # only line up when re-tokenizing the text gave the sampled ids.
-                    if mine.numel() == theirs.numel() and mine.numel() > 0:
-                        mismatches.append((mine - theirs).abs().mean().item())
-                    else:
-                        num_length_skips += 1
+                for j, item in enumerate(mb):
+                    n = int(b["attention_mask"][j].sum())
+                    mask_row = [int(x) for x in mask[j, :n].tolist()]
+                    values, ok = L.align_sampler_logprobs(mask_row, *sampler_turns(item[0], item[2]))
+                    diff = L.mean_abs_diff(new_lp[j, :n].detach().float().cpu().tolist(), values, mask_row)
+                    if diff == diff:
+                        seq_diffs.append(diff)
+                    num_unaligned += int(not ok)
             del new_lp, old_lp, loss
 
         grad_norm = torch.nn.utils.clip_grad_norm_(params, g.max_grad_norm)
@@ -368,20 +459,32 @@ def train_phase(
     token_cache.clear()
     torch.cuda.empty_cache()  # return fragmented blocks so vLLM's next rollout is unaffected
 
-    def avg(key: str) -> float:
-        return sum(m[key] for m in all_metrics) / max(len(all_metrics), 1)
+    def avg(name: str) -> float:
+        vals = [m[name] for m in all_metrics if name in m]
+        return sum(vals) / len(vals) if vals else float("nan")
 
-    return {
+    out = {
         "loss": sum(loss_values) / max(len(loss_values), 1),
         "grad_norm": sum(grad_norms) / max(len(grad_norms), 1),
+        "grad_norm_max": max(grad_norms, default=float("nan")),
         "train/clip_frac": avg("clip_frac"),
         "train/approx_kl": avg("approx_kl"),
         "train/ratio_mean": avg("ratio_mean"),
         "train/ratio_max": max((m["ratio_max"] for m in all_metrics), default=1.0),
         "train/entropy_proxy": avg("entropy_proxy"),
-        "sampler/mean_abs_logp_diff": sum(mismatches) / len(mismatches) if mismatches else float("nan"),
-        "sampler/length_mismatch_skips": float(num_length_skips),
+        "train/sequences": float(len(seqs)),
+        "sampler/mean_abs_logp_diff": sum(seq_diffs) / len(seq_diffs) if seq_diffs else float("nan"),
+        # Sequences whose re-tokenized assistant text didn't line up with vLLM's tokens.
+        "sampler/length_mismatch_skips": float(num_unaligned),
+        **drop_metrics,
     }
+    if ratio_cap is not None:
+        out["train/ratio_capped_frac"] = avg("ratio_capped_frac")
+        out["train/ratio_over_cap_frac"] = avg("ratio_over_cap_frac")
+    if tis_cap is not None:
+        out["train/tis_weight_mean"] = avg("tis_weight_mean")
+        out["train/tis_capped_frac"] = avg("tis_capped_frac")
+    return out
 
 
 def train_with_oom_retry(*args: Any, micro_bs: int) -> tuple[dict[str, float], int]:
@@ -472,30 +575,33 @@ def load_training_state(ckpt: Path, optimizer, scheduler) -> dict:
 
 
 def run_midtrain_eval(cfg: Config, tasks: list[str], step: int, policy: VLLMPolicy, pool: EnvPool) -> float | None:
-    """Runs the eval.yaml `midtrain` preset in-process. Never raises."""
+    """Runs the eval.yaml `midtrain` preset in-process. Never raises.
+
+    The eval copies the training config's `env` and `model` blocks, so it sees
+    the same prompt, tools, turn limits, and history window as training.
+    `grpo.eval_seed_range` picks the seeds (default: `eval`). Run 4 uses the
+    `baseline` range, so choosing the best checkpoint by this score doesn't
+    use the seeds of the headline evals.
+    """
     try:
         from cua.eval import evaluate  # imported lazily so a broken eval cannot stop training
 
         ecfg = load_config(
             "configs/eval.yaml",
-            # Copy the settings that change what the model sees, so the eval
-            # prompt matches training (Track B uses more turns, for example).
-            [
-                "eval.mode=midtrain",
-                # report.py looks for exactly this name pattern.
-                f"run_name=grpo-step{step}-train",
-                f"env.track={cfg.env.track}",
-                f"env.max_turns={cfg.env.max_turns}",
-                f"env.first_obs_image={str(bool(cfg.env.first_obs_image)).lower()}",
-                f"env.screenshot_long_side={cfg.env.screenshot_long_side}",
-                f"model.name={cfg.model.name}",
-            ],
+            # report.py looks for exactly this name pattern.
+            ["eval.mode=midtrain", f"run_name=grpo-step{step}-train"],
         )
+        # Copy the settings that change what the model sees, so the eval
+        # prompt matches training (Track B uses more turns, for example).
+        ecfg["env"] = json.loads(json.dumps(cfg.env, default=str))
+        ecfg["model"] = json.loads(json.dumps(cfg.model, default=str))
         for key, value in ecfg.presets["midtrain"].items():  # apply the preset ourselves; it is idempotent
             ecfg.eval[key] = value
         ecfg.eval["tasks"] = list(tasks)
         if cfg.grpo.get("eval_num_seeds"):  # run 2: more seeds than the preset's 10
             ecfg.eval["num_seeds"] = int(cfg.grpo.eval_num_seeds)
+        if cfg.grpo.get("eval_seed_range"):
+            ecfg.eval["seed_range"] = str(cfg.grpo.eval_seed_range)
         summary = evaluate(ecfg, policy=policy, pool=pool, log_wandb=False)
         for key in ("success", "overall_success", "success_rate"):
             value = summary.get(key)
@@ -507,6 +613,49 @@ def run_midtrain_eval(cfg: Config, tasks: list[str], step: int, policy: VLLMPoli
     except Exception as exc:  # noqa: BLE001 - eval must never kill a training run
         log(f"midtrain eval failed ({type(exc).__name__}: {exc}); continuing")
     return None
+
+
+def read_best(out_dir: Path) -> dict | None:
+    """`best.json` next to the best adapter: {"step", "eval_success", ...}, or None."""
+    try:
+        data = json.loads((out_dir / "best" / "best.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and "eval_success" in data else None
+
+
+def is_new_best(success: float, best: dict | None) -> bool:
+    """True when a mid-training eval score beats the stored best (ties keep the older one)."""
+    return best is None or float(success) > float(best["eval_success"])
+
+
+def save_best(model, out_dir: Path, step: int, success: float, cfg: Config) -> None:
+    """Saves the adapter as `best/` with `best.json`, written aside and then renamed."""
+    final = out_dir / "best"
+    tmp = out_dir / "best.tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    model.save_pretrained(str(tmp))
+    info = {"step": int(step), "eval_success": float(success),
+            "seed_range": str(cfg.grpo.get("eval_seed_range") or "eval"),
+            "num_seeds": int(cfg.grpo.get("eval_num_seeds") or 10)}
+    (tmp / "best.json").write_text(json.dumps(info, indent=2))
+    shutil.rmtree(final, ignore_errors=True)
+    os.replace(tmp, final)
+    log(f"new best mid-training eval {success:.3f} at step {step}; saved {final}")
+
+
+def metrics_row(kind: str, step: int, values: dict) -> dict:
+    """One metrics.jsonl row. `kind` is "train" (one per step) or "eval" (mid-training eval).
+
+    Eval rows share the step number of the training row before them, so
+    readers must use `kind` to tell them apart.
+    """
+    return {"step": int(step), "kind": kind, **values}
+
+
+def wandb_values(record: dict) -> dict:
+    """The record without non-numeric bookkeeping fields, for W&B."""
+    return {k: v for k, v in record.items() if k not in ("kind",)}
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +768,7 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(g.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     track = cfg.env.track
-    tools = actions.tool_schemas(track)
+    tools = actions.tool_schemas(track, track == "B" and actions.extended_tools(cfg))
     random.seed(g.seed)
     torch.manual_seed(g.seed)
     if cfg.generation.temperature != 1.0:
@@ -758,8 +907,7 @@ def main(argv: list[str] | None = None) -> None:
 
                 # --- 7. Log.
                 free, total = torch.cuda.mem_get_info()
-                record: dict[str, Any] = {
-                    "step": step,
+                record: dict[str, Any] = metrics_row("train", step, {
                     **(rewards.episode_stats(alive) if alive else {}),
                     **(rewards.group_stats(rewards_by_group) if rewards_by_group else {}),
                     **counters,
@@ -773,13 +921,13 @@ def main(argv: list[str] | None = None) -> None:
                     # This process only: vLLM's engine runs in a child process.
                     "gpu/peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
                     "gpu/device_used_gb": (total - free) / 2**30,
-                }
+                })
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(record, default=str) + "\n")
                 if run:
                     import wandb
 
-                    run.log(record, step=step)
+                    run.log(wandb_values(record), step=step)
                     if step % 10 == 0 and alive:
                         table = wandb.Table(columns=["step", "task", "seed", "reward", "success", "responses"])
                         for ep in alive[:6]:
@@ -808,11 +956,18 @@ def main(argv: list[str] | None = None) -> None:
                 if g.eval_every and step % g.eval_every == 0:
                     success = run_midtrain_eval(cfg, tasks, step, policy, pool)
                     if success is not None:
-                        extra = {"step": step, "eval/success": success}
+                        extra = metrics_row("eval", step, {"eval/success": success})
                         with open(metrics_path, "a") as f:
                             f.write(json.dumps(extra) + "\n")
                         if run:
                             run.log({"eval/success": success}, step=step)
+                        # Run 4: keep the adapter with the best mid-training score,
+                        # so post_eval can choose between it and the final one.
+                        if g.get("keep_best") and is_new_best(success, read_best(out_dir)):
+                            try:
+                                save_best(model, out_dir, step, success, cfg)
+                            except Exception as exc:  # noqa: BLE001 - never stop training for this
+                                log(f"saving the best adapter failed ({type(exc).__name__}: {exc}); continuing")
                 step_done = True
         except KeyboardInterrupt:
             log("Ctrl-C: saving a checkpoint before exit")

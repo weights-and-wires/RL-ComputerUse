@@ -4,6 +4,8 @@ Command line:
 
     python -m cua.compare results/run2/eval/run1-pool2 results/run2/eval/run2-pool2
     python -m cua.compare A_DIR B_DIR --json results/run2/compare/pool2.json
+    python -m cua.compare A_DIR B_DIR --tasks run4_turn_limited       # a subset of tasks
+    python -m cua.compare A_DIR B_DIR --exclude-tasks sign-agreement  # all tasks but these
 
 Each argument is an eval output folder that holds `episodes.jsonl`. The script
 pairs episodes by (task, seed), using sample 0, and drops a pair when either
@@ -42,6 +44,14 @@ def load_outcomes(run_dir: Path) -> dict[tuple[str, int], bool]:
             continue
         out[(ep["task"], int(ep["seed"]))] = bool(ep["success"])
     return out
+
+
+def filter_tasks(
+    outcomes: dict[tuple[str, int], bool], keep: Optional[set] = None, drop: Optional[set] = None
+) -> dict[tuple[str, int], bool]:
+    """Keeps only the tasks in `keep` (when given) and removes those in `drop`."""
+    return {k: v for k, v in outcomes.items()
+            if (keep is None or k[0] in keep) and (drop is None or k[0] not in drop)}
 
 
 def pair(a: dict[tuple[str, int], bool], b: dict[tuple[str, int], bool]) -> dict[str, list[tuple[int, int]]]:
@@ -134,9 +144,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("run_b", help="Eval folder of the model being compared.")
     parser.add_argument("--json", default=None, help="Also write the result to this JSON file.")
     parser.add_argument("--n-boot", type=int, default=10_000, help="Bootstrap resamples. Default: 10000.")
+    parser.add_argument("--tasks", default=None,
+                        help="Compare only these tasks: comma-separated names or a task-list name (cua.config).")
+    parser.add_argument("--exclude-tasks", default=None, help="Leave out these tasks (same forms as --tasks).")
     args = parser.parse_args(argv)
 
     a, b = load_outcomes(Path(args.run_a)), load_outcomes(Path(args.run_b))
+    if args.tasks or args.exclude_tasks:
+        from cua.config import resolve_task_list
+
+        keep = set(resolve_task_list(args.tasks)) if args.tasks else None
+        drop = set(resolve_task_list(args.exclude_tasks)) if args.exclude_tasks else None
+        a, b = filter_tasks(a, keep, drop), filter_tasks(b, keep, drop)
     by_task = pair(a, b)
     if not by_task:
         raise SystemExit("The two runs share no (task, seed) pairs.")
@@ -149,7 +168,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.json:
         out = Path(args.json)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"a": args.run_a, "b": args.run_b, **result}, indent=2))
+        out.write_text(json.dumps({"a": args.run_a, "b": args.run_b, "tasks": args.tasks,
+                                   "exclude_tasks": args.exclude_tasks, **result}, indent=2))
         print(f"Wrote {out}")
 
 

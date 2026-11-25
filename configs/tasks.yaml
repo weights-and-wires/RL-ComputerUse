@@ -173,3 +173,129 @@ seeds:
   baseline: {start: 100,  count: 100}      # sampled baseline for task selection
   rft:      {start: 200,  count: 800}      # rejection-sampling warm start
   train:    {start: 1000, count: 1000000}  # GRPO draws seeds from here
+
+# ---------------------------------------------------------------------------
+# Run 4 (docs/PLAN_RUN4.md): Track B with 20 turns, double_click, and
+# left_click_drag. The run-4 candidates (task list "candidates_run4") are run
+# 3's candidates without run4_exclude, plus the two lists below.
+# ---------------------------------------------------------------------------
+
+# Tasks that need a drag (or a text selection by drag). Track B can try them
+# only with run 4's left_click_drag. use-colorwheel and use-colorwheel-2 were
+# run-3 candidates already, at 0%. draw-circle stays out: it needs a curved
+# path, and left_click_drag draws one straight line.
+train_candidates_run4_new_action:
+  - use-slider
+  - use-slider-2
+  - use-colorwheel
+  - use-colorwheel-2
+  - drag-box
+  - drag-circle
+  - drag-cube
+  - drag-items
+  - drag-items-grid
+  - drag-shapes
+  - drag-shapes-2
+  - drag-single-shape
+  - drag-sort-numbers
+  - highlight-text
+  - highlight-text-2
+  - resize-textarea
+  - draw-line
+  - text-editor
+
+# Registered tasks that no earlier run screened. The *-nodelay variants stay
+# out (duplicates without animation delay), and so do the tasks close to a
+# held-out task (see train_candidates_run2_extra).
+train_candidates_run4_extra:
+  - choose-date-easy
+  - choose-date-medium
+  - click-tab-2-easy
+  - click-tab-2-medium
+  - daily-calendar
+  - email-inbox-noscroll
+  - form-sequence
+  - generate-number
+  - hot-cold
+  - scroll-text
+  - simple-algebra
+  - terminal
+  - unicode-test
+
+# Run 3's training pool (results/run3/selected_tasks.json), frozen because
+# results/ isn't in git. Run 4 replays its solved tasks.
+run3_pool:
+  - choose-date
+  - use-spinner
+  - click-scroll-list
+  - find-word
+  - click-widget
+  - click-collapsible-2
+  - bisect-angle
+  - visual-addition
+  - right-angle
+  - click-tab-2-hard
+  - simple-arithmetic
+  - click-tab-2
+  - odd-or-even
+  - scroll-text-2
+  - find-greatest
+  - stock-market
+  - form-sequence-2
+  - multi-layouts
+
+# Tasks that ran out of turns in half or more of the run-3 Track B screen
+# (results/run3/eval/baseline/per_task.csv, 10 turns). The run-4 pool
+# reserves slots for them.
+run4_long_horizon:
+  - book-flight
+  - social-media-some
+  - grid-coordinate
+  - guess-number
+  - choose-list
+  - number-checkboxes
+  - email-inbox-reply
+  - social-media-all
+  - click-collapsible-2
+  - email-inbox
+  - email-inbox-star-reply
+  - search-engine
+  - social-media
+  - right-angle
+  - choose-date
+  - tic-tac-toe
+  - phone-book
+
+# The tasks run 4's success criterion names: they failed by running out of
+# turns at 10 turns. Run 4 wants at least 30% on them, on average.
+run4_turn_limited:
+  - book-flight
+  - social-media-some
+  - search-engine
+  - email-inbox-reply
+  - number-checkboxes
+  - choose-list
+  - grid-coordinate
+  - guess-number
+
+# Left out of run 4's pool. The reasons are in docs/PLAN_RUN4.md.
+run4_exclude:
+  stock-market: "timing coin flip: the price changes every 100 ms, so the click lands 10-30 ticks after the screenshot"
+
+# Left out of the full-suite eval (every other registered task is in it).
+full_suite_exclude:
+  stock-market: "timing coin flip (see run4_exclude)"
+  draw-circle: "needs a curved path; left_click_drag draws a straight line"
+  book-flight-nodelay: "duplicate of book-flight without the animation delay"
+  choose-date-nodelay: "duplicate of choose-date without the animation delay"
+  click-collapsible-nodelay: "duplicate of click-collapsible without the animation delay"
+  click-collapsible-2-nodelay: "duplicate of click-collapsible-2 without the animation delay"
+  click-pie-nodelay: "duplicate of click-pie without the animation delay"
+  use-autocomplete-nodelay: "duplicate of use-autocomplete without the animation delay"
+
+# Eval seeds (0-99) on which sign-agreement asks only to click Cancel. On the
+# other 58 seeds it asks to scroll a disabled text area to the bottom first.
+# Emulated from the task's seeded draws, and equal to the 42 seeds that run 3's
+# adapter solved (results/run3/eval/run3-heldout3). A success outside this list
+# is long-horizon progress. See docs/PLAN_RUN4.md.
+sign_agreement_cancel_only_seeds: [0, 2, 3, 4, 5, 6, 7, 8, 9, 12, 14, 15, 18, 19, 21, 28, 29, 30, 33, 35, 37, 40, 42, 43, 44, 45, 49, 53, 57, 58, 61, 62, 67, 73, 76, 82, 85, 90, 91, 94, 98, 99]

@@ -205,10 +205,15 @@ def cmd_collect(cfg: Config) -> None:
             # The cap stops easy tasks from dominating the dataset.
             if not clean or kept[ep.task] >= cap:
                 continue
-            messages = _serialize_messages(ep.messages, image_dir, dataset_dir, f"{ep.task}_seed{ep.seed}_s{ep.sample_idx}")
-            ds_file.write(
-                json.dumps({"task": ep.task, "seed": ep.seed, "track": ep.track, "messages": messages}) + "\n"
-            )
+            # One row per conversation: an episode with a history window (run 4)
+            # has several segments, and each is a complete training sample.
+            for ci, conv in enumerate(ep.conversations()):
+                messages = _serialize_messages(
+                    conv, image_dir, dataset_dir, f"{ep.task}_seed{ep.seed}_s{ep.sample_idx}_c{ci}"
+                )
+                ds_file.write(
+                    json.dumps({"task": ep.task, "seed": ep.seed, "track": ep.track, "messages": messages}) + "\n"
+                )
             kept[ep.task] += 1
 
     stats = {
@@ -277,7 +282,7 @@ def cmd_train(cfg: Config, dataset_arg: str | None = None) -> None:
     if not rows:
         raise SystemExit(f"{dataset_dir} holds no episodes. Run `collect` first.")
     track = cfg.env.track
-    tools = actions.tool_schemas(track)
+    tools = actions.tool_schemas(track, track == "B" and actions.extended_tools(cfg))
 
     # Run 3 continues the run-2 adapter (model.adapter); runs 1 and 2 left it
     # null, which starts a fresh LoRA on the base model.

@@ -25,7 +25,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from cua import actions, prompts, rewards
-from cua.config import Config
+from cua.config import Config, turn_limit
+from cua.samples import action_text
 from cua.types import (
     CONTEXT_OVERFLOW,
     Episode,
@@ -71,6 +72,26 @@ class _Slot:
     env: Any  # a RemoteEnv
     episode: Episode
     obs: Observation
+    limit: int = 0  # this episode's turn limit (env.max_turns, or the task's budget)
+    seg_turns: int = 0  # turns in the current segment (history window only)
+
+
+def start_new_segment(ep: Episode, obs: Observation, track: Track, extended: bool) -> None:
+    """Closes the current conversation and opens the next segment of a windowed episode.
+
+    The finished segment drops its trailing tool message: the model never
+    answers it there, and the new segment shows the same screenshot again.
+    The new segment opens with a text log of every turn so far. See the
+    history-window notes in `cua.prompts`.
+    """
+    seg = ep.messages  # the same list object the prompts used, so callers can match them
+    if seg and seg[-1].get("role") == "tool":
+        seg.pop()
+    ep.segments.append(seg)
+    history = [
+        prompts.history_line(i + 1, action_text(t.parsed), t.env_error) for i, t in enumerate(ep.turns)
+    ]
+    ep.messages = prompts.segment_messages(obs, track, True, history, extended)
 
 
 def _timed(fn: Callable[..., Any], *args: Any) -> tuple[Any, Optional[Exception]]:
@@ -107,7 +128,10 @@ def run_episodes(
         generate: Maps (conversations, sampling, tool schemas) to Generations.
             Pass `VLLMPolicy.generate`, or a fake in tests.
         pool: An EnvPool of RemoteEnvs.
-        cfg: Config. Uses `cfg.env.max_turns`, `cfg.env.first_obs_image`, `cfg.env.track`.
+        cfg: Config. Uses `cfg.env.max_turns`, `cfg.env.first_obs_image`,
+            `cfg.env.track`, and, when set, `env.turn_budgets` (per-task turn
+            limits), `env.context_window_turns` (history window), and
+            `env.track_b_extra_tools` (double_click and left_click_drag).
         sampling: Decoding settings for every generate() call.
         track: "A" or "B". Defaults to `cfg.env.track`.
         progress: Show a tqdm progress bar.
@@ -121,13 +145,18 @@ def run_episodes(
         - A response with no tool call ends it (format error, nothing to execute).
         - A tool call with bad arguments sends the error back as the tool result
           and the episode continues.
-        - Reaching `max_turns` ends it with `truncated=True`.
+        - Reaching the turn limit ends it with `truncated=True`.
         - An env exception sets `episode.crashed` and ends it.
+        - With `env.context_window_turns = W > 0`, every W turns the episode
+          starts a new conversation (segment) that holds a text log of the
+          earlier turns and only the newest screenshots. Each prompt is still
+          a prefix of its finished segment, so training sees the same tokens.
     """
     track = track or cfg.env.track
-    max_turns = int(cfg.env.max_turns)
     with_image = bool(cfg.env.get("first_obs_image", True))
-    tools = actions.tool_schemas(track)
+    extended = track == "B" and actions.extended_tools(cfg)
+    window = int(cfg.env.get("context_window_turns", 0) or 0)
+    tools = actions.tool_schemas(track, extended)
 
     results: list[Optional[Episode]] = [None] * len(specs)
     queue: deque[int] = deque(range(len(specs)))
@@ -180,17 +209,24 @@ def run_episodes(
                         ep.crashed = f"reset failed: {exc}"
                         finish(None, ep, env, idx)
                         continue
-                    ep.messages = prompts.initial_messages(obs, track, with_image=with_image)
+                    ep.messages = prompts.initial_messages(obs, track, with_image=with_image, extended=extended)
                     if spec.record:
                         # Use the full-size reset frame the env kept, so every GIF
                         # frame has the same size as the full-size step frames.
                         first = getattr(env, "reset_frame", None) or obs.screenshot
                         if first is not None:
                             ep.frames.append(first.copy())
-                    active.append(_Slot(idx, spec, env, ep, obs))
+                    active.append(_Slot(idx, spec, env, ep, obs, limit=turn_limit(cfg, spec.task)))
 
             if not active:
                 continue  # every started episode crashed on reset; try the queue again
+
+            # ---- 1b. History window: open a new segment where one is due ----
+            if window > 0:
+                for slot in active:
+                    if slot.seg_turns >= window:
+                        start_new_segment(slot.episode, slot.obs, track, extended)
+                        slot.seg_turns = 0
 
             # ---- 2. One generate() call for all active episodes -------------
             t0 = time.perf_counter()
@@ -215,15 +251,17 @@ def run_episodes(
                     ep.truncated = True
                     finish(slot, ep, slot.env, slot.index)
                     continue
-                parsed = actions.parse_response(gen.text, track, slot.obs.screen_size)
+                parsed = actions.parse_response(gen.text, track, slot.obs.screen_size, extended)
                 prompt_len = len(ep.messages)  # messages[:prompt_len] is this turn's input
+                segment = len(ep.segments)
+                slot.seg_turns += 1
 
                 if parsed.ends_episode:
                     # No tool call at all: nothing to run, and the episode ends.
                     # We still store the reply so RFT/GRPO can see what the model said.
                     ep.turns.append(
                         Turn(len(ep.turns) + 1, slot.obs, prompt_len, gen, parsed,
-                             env_error=parsed.format_error or "")
+                             env_error=parsed.format_error or "", segment=segment)
                     )
                     prompts.append_turn(ep.messages, gen.text, None, "")
                     _hold_frame(ep, slot.spec)
@@ -235,18 +273,18 @@ def run_episodes(
                     error_text = str({"error": parsed.format_error or "invalid tool call"})
                     ep.turns.append(
                         Turn(len(ep.turns) + 1, slot.obs, prompt_len, gen, parsed,
-                             env_error=parsed.format_error or "")
+                             env_error=parsed.format_error or "", segment=segment)
                     )
                     content = prompts.tool_result_content(slot.obs, track, error=error_text)
                     prompts.append_turn(ep.messages, gen.text, content, parsed.tool_name or "unknown")
                     _hold_frame(ep, slot.spec)
-                    if len(ep.turns) >= max_turns:
+                    if len(ep.turns) >= slot.limit:
                         ep.truncated = True
                         finish(slot, ep, slot.env, slot.index)
                     else:
                         still_active.append(slot)
                 else:
-                    to_step.append((slot, parsed, gen, prompt_len))
+                    to_step.append((slot, parsed, gen, prompt_len, segment))
                     still_active.append(slot)
 
             # ---- 4. Step all browsers in parallel ---------------------------
@@ -258,13 +296,13 @@ def run_episodes(
                 _bump(stats, "step_s", time.perf_counter() - t0)
                 _bump(stats, "env_s", time.perf_counter() - t0)
 
-                for (slot, parsed, gen, prompt_len), (res, exc) in zip(to_step, step_out):
+                for (slot, parsed, gen, prompt_len, segment), (res, exc) in zip(to_step, step_out):
                     ep = slot.episode
                     if exc is not None:
                         ep.crashed = f"step failed: {exc}"
                         ep.turns.append(
                             Turn(len(ep.turns) + 1, slot.obs, prompt_len, gen, parsed,
-                                 env_error=ep.crashed)
+                                 env_error=ep.crashed, segment=segment)
                         )
                         still_active.remove(slot)
                         finish(slot, ep, slot.env, slot.index)
@@ -274,7 +312,7 @@ def run_episodes(
                     new_obs = res.observation
                     ep.turns.append(
                         Turn(len(ep.turns) + 1, slot.obs, prompt_len, gen, parsed,
-                             env_error=new_obs.last_action_error)
+                             env_error=new_obs.last_action_error, segment=segment)
                     )
                     content = prompts.tool_result_content(
                         new_obs, track, error=new_obs.last_action_error
@@ -292,7 +330,7 @@ def run_episodes(
                     if ep.success or ep.terminated:
                         still_active.remove(slot)
                         finish(slot, ep, slot.env, slot.index)
-                    elif len(ep.turns) >= max_turns:
+                    elif len(ep.turns) >= slot.limit:
                         ep.truncated = True
                         still_active.remove(slot)
                         finish(slot, ep, slot.env, slot.index)
