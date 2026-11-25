@@ -1,4 +1,4 @@
-/* Run 3 live dashboard. Vanilla JS plus uPlot. No build step. */
+/* Multi-run dashboard (current run at /, finished runs at /runN/). Vanilla JS plus uPlot. No build step. */
 (function () {
   'use strict';
 
@@ -65,7 +65,7 @@
   }
 
   /* ---------- theme ---------- */
-  var themeMode = tget('run3-theme') || 'auto';
+  var themeMode = tget('cua-theme') || tget('run3-theme') || 'auto';
   function applyTheme() {
     var root = document.documentElement;
     if (themeMode === 'auto') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', themeMode);
@@ -78,7 +78,7 @@
   }
   $('#theme').addEventListener('click', function () {
     themeMode = themeMode === 'auto' ? 'light' : themeMode === 'light' ? 'dark' : 'auto';
-    tset('run3-theme', themeMode);
+    tset('cua-theme', themeMode);
     applyTheme();
     rebuildCharts();
   });
@@ -110,7 +110,7 @@
   var S = {
     state: null, evals: null, notes: null, samples: null,
     metrics: { rows: [], offset: 0 }, system: { rows: [], offset: 0 }, events: { rows: [], offset: 0 },
-    skew: 0, lastOk: 0, errors: {}
+    runs: null, skew: 0, lastOk: 0, errors: {}
   };
 
   function noteDate(resp) {
@@ -162,42 +162,104 @@
     });
   }
 
-  /* ---------- header, cost, progress ---------- */
+  /* ---------- header, tabs, cost, progress ---------- */
   var STATE_TONE = {
-    running: 'sage', done: 'sage', failed: 'oxblood', idle: '',
+    running: 'sage', done: 'sage', failed: 'oxblood', idle: '', not_started: '',
     creating_pod: 'ochre', bootstrapping: 'ochre', restarting: 'ochre', recreating_pod: 'ochre',
     stopping: 'ochre', uploading: 'ochre', deleting: 'ochre'
   };
+  var PLAN_PHASES = ['smoke', 'screen', 'select', 'rft', 'pre_eval', 'grpo', 'post_eval', 'compare', 'report'];
   function nowMs() { return Date.now() + S.skew; }
 
+  function currentRun() {
+    var r = S.runs;
+    if (!r) return null;
+    for (var i = 0; i < r.runs.length; i++) if (r.runs[i].name === r.current) return r.runs[i];
+    return null;
+  }
+  function isLiveMount() {
+    var c = currentRun();
+    if (c) return !!c.live;
+    return /^\/(index\.html)?$/.test(location.pathname);
+  }
+  /* The live run has not started when the monitor hasn't written anything or is idle. */
+  function notStarted() {
+    return isLiveMount() && (!S.state || S.state.run_state === 'idle' || S.state.demo === true);
+  }
+  function runLabel() {
+    if (S.state && S.state.run_label && !notStarted()) return S.state.run_label;
+    var c = currentRun();
+    return c ? c.label : 'Run';
+  }
+  function isSnapshot() { return !!(S.state && S.state.snapshot); }
+  /* The state the page renders: the real one, or a plan when the run hasn't started. */
+  function eff() {
+    if (notStarted()) {
+      return {
+        run_state: 'not_started', phases: PLAN_PHASES.map(function (n) { return { name: n, status: 'pending' }; }),
+        budget_usd: 50, spend_usd: 0, grpo: {}, pod: {}, planned: true
+      };
+    }
+    return S.state || {};
+  }
+
+  function renderTabs() {
+    var nav = $('#runtabs');
+    var runs = S.runs && S.runs.runs;
+    if (!runs) return;
+    var sig = JSON.stringify(runs.map(function (r) { return [r.name, r.label, r.run_state, r.live]; })) + S.runs.current;
+    if (nav.dataset.sig === sig) return;
+    nav.dataset.sig = sig; clear(nav);
+    var activeStates = ['creating_pod', 'bootstrapping', 'running', 'restarting', 'recreating_pod', 'stopping', 'uploading', 'deleting'];
+    runs.forEach(function (r) {
+      var a = h('a', { href: r.path }, h('span', { class: 'pip' + (activeStates.indexOf(r.run_state) >= 0 ? ' live' : (r.live && (r.run_state === 'not_started' || r.run_state === 'idle') ? ' active' : '')) }), r.label,
+        r.live ? h('span', { class: 'tag', text: activeStates.indexOf(r.run_state) >= 0 ? 'live' : (r.run_state === 'not_started' || r.run_state === 'idle' ? 'not started' : r.run_state) }) : null);
+      if (r.name === S.runs.current) a.setAttribute('aria-current', 'page');
+      nav.appendChild(a);
+    });
+  }
+
   function renderHeader() {
-    var st = S.state;
+    var st = eff();
+    var label = runLabel();
+    document.title = label + (notStarted() ? ' (not started)' : (isSnapshot() || st.run_state === 'done' || st.run_state === 'failed') ? ' (finished)' : ' live');
+    $('#eyebrow').textContent = label + ' \u00b7 Qwen3-VL-4B';
     var badge = $('#badge');
-    if (!st) { $('#badge-text').textContent = 'no data'; $('#updated').textContent = 'waiting for the monitor'; return; }
+    if (!S.state && !st.planned) { $('#badge-text').textContent = 'no data'; $('#updated').textContent = 'waiting for the monitor'; return; }
     var rs = st.run_state || 'unknown';
     badge.className = 'badge ' + rs + ' tone-' + (STATE_TONE[rs] || '');
     $('#badge-text').textContent = rs.replace(/_/g, ' ');
-    $('#demo-banner').hidden = !st.demo;
+    var ns = $('#nostart-banner');
+    ns.hidden = !st.planned;
+    if (st.planned) ns.textContent = label + " hasn't started yet. This page fills in live when the monitor creates the pod. " +
+      'The plan: nine phases (listed below, all waiting), one rented H100 GPU, and a ' + fmtUsd(st.budget_usd) + ' cap that the monitor enforces.';
+    var sb = $('#snapshot-banner');
+    sb.hidden = !isSnapshot() && !(!isLiveMount() && st.run_state === 'done');
+    sb.textContent = label + ' is finished. This tab is a read-only record of its results.';
+    $('#demo-banner').hidden = true;
+    $('#cost').hidden = isSnapshot() && !isNum(st.spend_usd);
+    $('#system').hidden = isSnapshot();
+    var cap = $('#cap-text'); if (cap && isNum(st.budget_usd)) cap.textContent = fmtUsd(st.budget_usd).replace('.00', '') + ' cap';
     var phase = st.current_phase;
     var g = st.grpo || {};
     var bits = [];
     if (phase) bits.push('phase: ' + phase);
-    if (isNum(g.step) && isNum(g.max_steps)) bits.push('step ' + g.step + '/' + g.max_steps);
-    $('#phase-now').textContent = bits.join(' · ');
+    if (isNum(g.step) && isNum(g.max_steps) && !isSnapshot()) bits.push('step ' + g.step + '/' + g.max_steps);
+    $('#phase-now').textContent = bits.join(' \u00b7 ');
     var eb = $('#error-banner');
     if (st.last_error) { eb.hidden = false; eb.textContent = 'Last error: ' + String(st.last_error).slice(0, 400); } else eb.hidden = true;
     tickUpdated();
   }
   function tickUpdated() {
     var st = S.state;
-    if (!st) return;
-    var t = parseT(st.updated);
     var el = $('#updated'), sb = $('#stale-banner');
+    if (!st || notStarted() || isSnapshot()) { if (el) el.textContent = notStarted() ? 'waiting for the monitor to arm' : ''; sb.hidden = true; return; }
+    var t = parseT(st.updated);
     if (t == null) { el.textContent = ''; return; }
     var age = (nowMs() - t) / 1000;
     el.textContent = 'updated ' + fmtAgo(age);
     var active = ['running', 'creating_pod', 'bootstrapping', 'restarting', 'recreating_pod', 'stopping', 'uploading', 'deleting'].indexOf(st.run_state) >= 0;
-    if (active && !st.demo && age > 300) {
+    if (active && age > 300) {
       sb.hidden = false;
       sb.textContent = 'The monitor has not reported for ' + fmtDur(age) + '. The numbers below may be out of date.';
     } else sb.hidden = true;
@@ -211,9 +273,9 @@
   }
 
   function renderCost() {
-    var st = S.state || {};
+    var st = eff();
     var box = $('#cost-stats'); clear(box);
-    var budget = isNum(st.budget_usd) ? st.budget_usd : 50;
+    var budget = isNum(st.budget_usd) && st.budget_usd > 0 ? st.budget_usd : 50;
     var spend = isNum(st.spend_usd) ? st.spend_usd : 0;
     var rate = st.pod && isNum(st.pod.cost_per_hr) ? st.pod.cost_per_hr : null;
     var sys = S.system.rows;
@@ -247,7 +309,7 @@
   }
 
   function renderProgress() {
-    var st = S.state || {};
+    var st = eff();
     var phases = Array.isArray(st.phases) ? st.phases : [];
     var bar = $('#phasebar'); clear(bar);
     var list = $('#phase-list'); clear(list);
@@ -289,7 +351,7 @@
 
   /* ---------- metric charts ---------- */
   var charts = [];
-  var smoothing = parseFloat(tget('run3-smooth'));
+  var smoothing = parseFloat(tget('cua-smooth') || tget('run3-smooth'));
   if (!isFinite(smoothing)) smoothing = 0.6;
   var smoothInput = $('#smooth');
   smoothInput.value = smoothing;
@@ -318,7 +380,7 @@
     ['g-signal', 'reward', 'Reward', 'Average reward per attempt, including bonuses and penalties.',
       [{ key: 'reward/total', label: 'total', tone: 'ink', ema: true }, { key: 'reward/success', label: 'from success', tone: 'sage', ema: true, dash: [4, 3] }], { min0: true }],
     ['g-signal', 'eval', 'Mid-training exam', 'Success on a fixed exam run every few steps.',
-      [{ key: 'eval/success', label: 'exam success', tone: 'plum', pts: true }], { frac: true }],
+      [{ key: 'eval/success', label: 'exam success', tone: 'plum', pts: true }], { frac: true, source: 'eval' }],
     ['g-signal', 'fail', 'Why attempts fail', 'Share of attempts ending each way (smoothed).',
       [{ key: 'failure/ran_out_of_turns', label: 'ran out of turns', tone: 'amber', ema: true },
        { key: 'failure/wrong_action', label: 'wrong action', tone: 'oxblood', ema: true, dash: [5, 3] },
@@ -365,8 +427,9 @@
       [{ key: 'gpu/device_used_gb', label: 'device used', tone: 'ink' }, { key: 'gpu/peak_allocated_gb', label: 'peak allocated', tone: 'amber', dash: [5, 3] }], { min0: true }]
   ];
 
-  var CLAIMED_PREFIX = ['success/', 'task_rate/', 'task_weight/', 'format_error/'];
-  var CLAIMED_KEYS = { step: 1, 'success/overall': 1 };
+  var CLAIMED_PREFIX = ['success/', 'task_rate/', 'task_weight/', 'format_error/', 'eval/'];
+  var CLAIMED_META = { kind: 1 };
+  var CLAIMED_KEYS = { step: 1, kind: 1, 'success/overall': 1 };
   METRIC_SPECS.forEach(function (s) { s[4].forEach(function (x) { if (x.key) CLAIMED_KEYS[x.key] = 1; }); });
   ['episodes/crashed', 'dyn/mixed_groups', 'groups/count', 'groups/mean_reward', 'failure/success', 'reward/format_penalty', 'reward/efficiency_bonus', 'micro_batch_episodes', 'sampler/length_mismatch_skips', 'reward/success'].forEach(function (k) { CLAIMED_KEYS[k] = CLAIMED_KEYS[k] || 0; });
 
@@ -543,17 +606,35 @@
     rows.forEach(function (r) { if (isNum(r.step)) byStep[r.step] = r; });
     return Object.keys(byStep).map(Number).sort(function (a, b) { return a - b; }).map(function (k) { return byStep[k]; });
   }
+  /* A mid-training exam row shares its step with a training row. Run 4 rows say
+     "kind": "train" or "eval". Run 3 rows have no kind, so the keys decide: an
+     exam row has eval/ keys and none of the training keys. */
+  function isEvalRow(r) {
+    if (r.kind === 'eval') return true;
+    if (r.kind === 'train') return false;
+    var hasEval = false;
+    for (var k in r) if (k.indexOf('eval/') === 0) { hasEval = true; break; }
+    return hasEval && r['reward/total'] === undefined && r['success/overall'] === undefined && r.loss === undefined;
+  }
+  function splitRows(rows) {
+    var train = [], ev = [];
+    rows.forEach(function (r) { (isEvalRow(r) ? ev : train).push(r); });
+    return { train: dedupeRows(train), eval: dedupeRows(ev) };
+  }
 
   function renderMetricCharts() {
-    var rows = dedupeRows(S.metrics.rows);
+    var split = splitRows(S.metrics.rows);
+    var rows = split.train;
     var xs = rows.map(function (r) { return r.step; });
     charts.forEach(function (c) {
       if (c.kind !== 'metric') return;
+      var src = c.spec.opts.source === 'eval' ? split.eval : rows;
+      var cxs = src === rows ? xs : src.map(function (r) { return r.step; });
       var series = c.spec.defs.map(function (d) {
-        var vals = rows.map(function (r) { return d.get ? num(d.get(r)) : num(r[d.key]); });
+        var vals = src.map(function (r) { return d.get ? num(d.get(r)) : num(r[d.key]); });
         return { label: d.label, tone: d.tone, dash: d.dash, ema: d.ema, pts: d.pts, cum: d.cum, dotsOnly: d.dotsOnly, vals: vals };
       });
-      try { c.update(xs, series, c.spec.opts); } catch (e) { console.error('chart', c.spec.id, e); c.root.hidden = true; }
+      try { c.update(cxs, series, c.spec.opts); } catch (e) { console.error('chart', c.spec.id, e); c.root.hidden = true; }
     });
     // other numeric keys
     var keys = {};
@@ -621,7 +702,7 @@
   smoothInput.addEventListener('input', function () {
     smoothing = parseFloat(smoothInput.value);
     $('#smooth-val').textContent = smoothing.toFixed(2);
-    tset('run3-smooth', String(smoothing));
+    tset('cua-smooth', String(smoothing));
     renderMetricCharts();
   });
 
@@ -633,12 +714,61 @@
     return [Math.max(0, c - hw), Math.min(1, c + hw)];
   }
   var evalSel = {};
-  function pickEval(names, kind) {
-    var isBase = function (n) { return /base|before|pre[-_]|start|zero/i.test(n); };
-    var inKind = names.filter(function (n) { return kind === 'held' ? /held/i.test(n) : !/held/i.test(n); });
-    var pool = inKind.length ? inKind : [];
-    var bases = pool.filter(isBase), afters = pool.filter(function (n) { return !isBase(n); });
-    return { before: bases.length ? bases[bases.length - 1] : (pool[0] || ''), after: afters.length ? afters[afters.length - 1] : '', pool: pool };
+  /* Pair exams generically. An exam name is a role word plus a common suffix:
+     pre-pool / post-pool, base-heldout3 / run3-heldout3, pre-full / post-full.
+     Words for "before": pre, base, baseline, before, start, zero, init. Words for
+     "after": post, after, final, end, grpo, and the current run's own name. The name
+     of another run counts as "before" (an earlier run's score on the same exam). */
+  var BEFORE_W = { pre: 1, base: 1, baseline: 1, before: 1, start: 1, zero: 1, init: 1, initial: 1 };
+  var AFTER_W = { post: 1, after: 1, final: 1, end: 1, grpo: 1 };
+  function classify(name) {
+    var cur = String(runCurrentName() || '').toLowerCase();
+    var toks = name.split(/[-_]/), role = null, word = null, rest = [];
+    toks.forEach(function (t) {
+      var lt = t.toLowerCase();
+      if (role) { rest.push(t); return; }
+      if (BEFORE_W[lt]) { role = 'before'; word = lt; }
+      else if (AFTER_W[lt]) { role = 'after'; word = lt; }
+      else if (/^run\d+[a-z]?$/.test(lt)) { var mine = cur && lt.indexOf(cur) === 0; role = mine ? 'after' : 'before'; word = mine ? 'self' : 'other'; }
+      else rest.push(t);
+    });
+    return { role: role, word: word, key: rest.join('-') };
+  }
+  function runCurrentName() {
+    var c = currentRun();
+    return (S.state && S.state.run) || (c && c.name) || '';
+  }
+  function groupEvals(names) {
+    var groups = {};
+    names.forEach(function (n) {
+      var c = classify(n);
+      if (!c.role || !c.key) return;
+      var g = groups[c.key] || (groups[c.key] = { key: c.key, before: [], after: [], names: [] });
+      g[c.role].push({ name: n, word: c.word });
+    });
+    var firstOf = function (list, prefer) {
+      for (var i = 0; i < prefer.length; i++) for (var j = 0; j < list.length; j++) if (list[j].word === prefer[i]) return list[j].name;
+      return list.length ? list[0].name : '';
+    };
+    var out = [];
+    Object.keys(groups).forEach(function (k) {
+      var g = groups[k];
+      if (!g.before.length) return;  // an exam with no "before" has nothing to compare with
+      g.beforeName = firstOf(g.before, ['pre', 'base', 'baseline', 'before', 'start', 'zero', 'init', 'initial']);
+      g.afterName = firstOf(g.after, ['post', 'final', 'after', 'end', 'self', 'grpo']);
+      g.pool = g.before.concat(g.after).map(function (x) { return x.name; });
+      out.push(g);
+    });
+    var rank = function (k) { return /pool/i.test(k) ? 0 : /held/i.test(k) ? 1 : /full|suite|all/i.test(k) ? 2 : 3; };
+    out.sort(function (x, y) { return rank(x.key) - rank(y.key) || (x.key < y.key ? -1 : 1); });
+    return out;
+  }
+  function groupTitle(key) {
+    if (/held/i.test(key)) return 'Held-out tasks';
+    if (/pool/i.test(key)) return 'Pool tasks';
+    if (/full|suite/i.test(key)) return 'Full suite';
+    if (/train/i.test(key)) return 'Training tasks';
+    return key.replace(/[-_]/g, ' ').replace(/^./, function (c) { return c.toUpperCase(); });
   }
   function evalRow(name, b, a) {
     var row = h('div', { class: 'erow' + (name === 'mean' ? ' mean' : '') });
@@ -682,26 +812,25 @@
     var names = Object.keys(ev);
     var host = $('#eval-panels'); clear(host);
     if (!names.length) { host.appendChild(h('div', { class: 'empty', text: 'No exams have finished yet.' })); clear($('#eval-table')); return; }
-    [['held', 'Held-out tasks'], ['pool', 'Pool tasks']].forEach(function (kd) {
-      var kind = kd[0], pick = pickEval(names, kind);
-      var sel = evalSel[kind] || {};
-      if (!sel.before || names.indexOf(sel.before) < 0) sel.before = pick.before;
-      if (!sel.after || names.indexOf(sel.after) < 0) sel.after = pick.after;
-      evalSel[kind] = sel;
+    var groups = groupEvals(names);
+    if (!groups.length) host.appendChild(h('div', { class: 'empty', text: 'No before-and-after pair of exams has finished yet.' }));
+    groups.forEach(function (g) {
+      var sel = evalSel[g.key] || {};
+      if (!sel.before || names.indexOf(sel.before) < 0) sel.before = g.beforeName;
+      if (!sel.after || names.indexOf(sel.after) < 0) sel.after = g.afterName;
+      evalSel[g.key] = sel;
       var panel = h('div', { class: 'evalp' });
       var mk = function (which) {
         var s = h('select', { 'aria-label': which + ' exam' });
         s.appendChild(h('option', { value: '', text: '(none)' }));
-        (pick.pool.length ? pick.pool : names).forEach(function (n) { var o = h('option', { value: n, text: n }); if (n === sel[which]) o.selected = true; s.appendChild(o); });
-        if (sel[which] && (pick.pool.length ? pick.pool : names).indexOf(sel[which]) < 0) { var o2 = h('option', { value: sel[which], text: sel[which] }); o2.selected = true; s.appendChild(o2); }
+        g.pool.forEach(function (n) { var o = h('option', { value: n, text: n }); if (n === sel[which]) o.selected = true; s.appendChild(o); });
         s.addEventListener('change', function () { sel[which] = s.value; renderEvals(); });
         return s;
       };
-      panel.appendChild(h('div', { class: 'evalp-head' }, h('h3', { text: kd[1] }),
+      panel.appendChild(h('div', { class: 'evalp-head' }, h('h3', { text: groupTitle(g.key), title: g.key }),
         h('div', { class: 'evalp-pick' }, 'before', mk('before'), 'after', mk('after'))));
-      if (!pick.pool.length) { panel.appendChild(h('div', { class: 'empty', text: 'No ' + kd[1].toLowerCase() + ' exam has finished yet.' })); host.appendChild(panel); return; }
       var B = ev[sel.before], A = ev[sel.after];
-      panel.appendChild(h('div', { class: 'eleg' }, h('span', null, h('i', { class: 'b' }), 'before: ' + (sel.before || '–')), h('span', null, h('i', { class: 'a' }), 'after: ' + (sel.after || '–')), h('span', { text: '• = intervals do not overlap' })));
+      panel.appendChild(h('div', { class: 'eleg' }, h('span', null, h('i', { class: 'b' }), 'before: ' + (sel.before || '\u2013')), h('span', null, h('i', { class: 'a' }), 'after: ' + (sel.after || '\u2013')), h('span', { text: '\u2022 = intervals do not overlap' })));
       var tasks = {};
       [B, A].forEach(function (e) { if (e && e.tasks) Object.keys(e.tasks).forEach(function (k) { tasks[k] = 1; }); });
       var list = Object.keys(tasks);
@@ -852,7 +981,7 @@
   }
   function renderLinks() {
     var box = $('#links'); clear(box);
-    var st = S.state || {};
+    var st = eff();
     var add = function (label, url) { if (typeof url === 'string' && /^https?:\/\//.test(url)) box.appendChild(h('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: label + ' ↗' })); };
     add('Weights & Biases run', st.wandb_url); add('Hugging Face adapter', st.hf_url);
   }
@@ -869,7 +998,8 @@
       samples: fetchJSON('data/samples/index.json').then(function (v) { S.samples = v; }),
       metrics: fetchLines('data/metrics.jsonl', S.metrics),
       system: fetchLines('data/system.jsonl', S.system),
-      events: fetchLines('data/events.jsonl', S.events)
+      events: fetchLines('data/events.jsonl', S.events),
+      runs: fetchJSON('runs.json').then(function (v) { if (v) S.runs = v; })
     };
     var names = Object.keys(tasks);
     Promise.all(names.map(function (k) { return tasks[k].then(function () { delete S.errors[k]; }, function (e) { S.errors[k] = e && e.message || 'failed'; }); })).then(function () {
@@ -880,10 +1010,10 @@
   }
   function safe(fn) { try { fn(); } catch (e) { console.error(e); } }
   function renderAll() {
-    safe(renderHeader); safe(renderCost); safe(renderProgress);
+    safe(renderTabs); safe(renderHeader); safe(renderCost); safe(renderProgress);
     safe(renderMetricCharts); safe(renderSystemCharts);
     safe(renderEvals); safe(renderGallery); safe(renderEvents); safe(renderNotes); safe(renderLinks);
-    if (Object.keys(S.errors).length === 7) { var eb = $('#error-banner'); eb.hidden = false; eb.textContent = 'Cannot reach the data feed. Retrying every 15 seconds.'; }
+    if (Object.keys(S.errors).length >= 7) { var eb = $('#error-banner'); eb.hidden = false; eb.textContent = 'Cannot reach the data feed. Retrying every 15 seconds.'; }
   }
 
   /* ---------- live log ---------- */

@@ -1,0 +1,19 @@
+[Unit]
+Description=CUA live dashboard: current run at /, finished runs at /run3/, /run2/, /run1/ (read-only web server)
+After=network-online.target
+
+[Service]
+ExecStart=/home/linuxbrew/.linuxbrew/bin/python3 %h/cua-dashboard/server.py \
+  --data %h/cua-run4/data --live-name run4 \
+  --archive run3=%h/cua-run3/data \
+  --archive run2=%h/cua-runs/run2/data \
+  --archive run1=%h/cua-runs/run1/data \
+  --port 8790
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Read-only web server for the run 3 live dashboard.
+"""Read-only web server for the multi-run live dashboard.
 
-Serves three things:
+The current run is served at ``/`` and each finished run at ``/<name>/``
+(for example ``/run3/``). Every mount serves the same three things:
 
-* ``/``            the static page in ``dashboard/static/``.
-* ``/data/...``    the monitor's data directory (default ``~/cua-run3/data``),
-                   always with ``Cache-Control: no-cache``. Supports single-range
-                   requests so the page can fetch only the new bytes of a
-                   ``.jsonl`` file.
-* ``/api/log/stream``  server-sent events that tail ``log.txt``.
+* ``<mount>/``            the static page in ``dashboard/static/``.
+* ``<mount>/data/...``    that run's data directory, always with
+                          ``Cache-Control: no-cache``. Supports single-range
+                          requests so the page can fetch only the new bytes of a
+                          ``.jsonl`` file.
+* ``<mount>/api/log/stream``  server-sent events that tail that run's ``log.txt``.
+
+``<mount>/runs.json`` lists the runs for the page's tab bar.
 
 Python 3 standard library only. The server never writes, never lists
-directories, and refuses any path that resolves outside its two roots.
+directories, and refuses any path that resolves outside its roots.
 """
 
 import argparse
@@ -121,13 +124,15 @@ def new_lines(prev, cur):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "cua-run3-dashboard/1"
+    server_version = "cua-dashboard/2"
     protocol_version = "HTTP/1.1"
     timeout = 30
 
     # Set from main().
     static_root: Path
-    data_root: Path
+    live_name: str = "run4"
+    live_root: Path
+    archives: dict = {}   # name -> data root, newest run first when listed
 
     def log_message(self, fmt, *args):  # quiet, no client addresses in logs
         if os.environ.get("DASH_VERBOSE"):
@@ -205,22 +210,60 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def _mount(self, path):
+        """Split a URL path into (mount name, data root, path inside the mount)."""
+        parts = path.split("/", 2)  # ["", first, rest]
+        first = parts[1] if len(parts) > 1 else ""
+        if first in self.archives:
+            return first, self.archives[first], "/" + (parts[2] if len(parts) > 2 else "")
+        return self.live_name, self.live_root, path
+
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
-        if path == "/api/log/stream":
-            return self._log_stream()
-        if path == "/healthz":
+        name, root, rest = self._mount(path)
+        if name != self.live_name and path == "/" + name:
+            self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+            self.send_header("Location", "/" + name + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if rest == "/api/log/stream":
+            return self._log_stream(root)
+        if rest == "/healthz":
             return self._text(HTTPStatus.OK, "ok\n")
-        if path == "/data" or path.startswith("/data/"):
-            target = safe_resolve(self.data_root, path[len("/data"):])
+        if rest == "/runs.json":
+            return self._runs_json(name)
+        if rest == "/data" or rest.startswith("/data/"):
+            target = safe_resolve(root, rest[len("/data"):])
             if target is None:
                 return self._text(HTTPStatus.NOT_FOUND, "not found\n")
             return self._serve_file(target, allow_range=True)
-        rel = "index.html" if path in ("", "/") else path
+        rel = "index.html" if rest in ("", "/") else rest
         target = safe_resolve(self.static_root, rel)
         if target is None:
             return self._text(HTTPStatus.NOT_FOUND, "not found\n")
         return self._serve_file(target, allow_range=False)
+
+    def _runs_json(self, current):
+        def entry(name, root, live):
+            st = {}
+            try:
+                with open(root / "state.json", "rb") as fh:
+                    st = json.loads(fh.read().decode("utf-8", "replace")) or {}
+            except (OSError, ValueError):
+                st = {}
+            m = re.fullmatch(r"run(\d+)([a-z]?)", name)
+            label = st.get("run_label") or ("Run " + m.group(1) + m.group(2) if m else name)
+            state = st.get("run_state") if st else "not_started"
+            return {"name": name, "label": label, "path": "/" if live else "/" + name + "/", "live": live,
+                    "run_state": state or "not_started", "snapshot": bool(st.get("snapshot"))}
+        runs = [entry(self.live_name, self.live_root, True)]
+        for n in sorted(self.archives, key=lambda x: int(re.sub(r"\D", "", x) or 0), reverse=True):
+            runs.append(entry(n, self.archives[n], False))
+        body = json.dumps({"current": current, "runs": runs}).encode()
+        self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(body))
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _method_not_allowed(self):
         self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
@@ -236,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(("event: %s\ndata: %s\n\n" % (event, data)).encode())
         self.wfile.flush()
 
-    def _log_stream(self):
+    def _log_stream(self, data_root):
         global _sse_clients
         with _sse_lock:
             if _sse_clients >= MAX_SSE_CLIENTS:
@@ -251,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.end_headers()
             self.close_connection = True
-            log_path = self.data_root / "log.txt"
+            log_path = data_root / "log.txt"
             self.wfile.write(b"retry: 5000\n\n")
             prev = read_lines(log_path)
             self._sse("init", {"lines": prev[-BACKLOG_LINES:]})
@@ -298,16 +341,27 @@ class Server(ThreadingHTTPServer):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--data", default="~/cua-run3/data", help="data directory to serve at /data/")
+    ap.add_argument("--data", default="~/cua-run4/data", help="current run's data directory, served at /")
+    ap.add_argument("--live-name", default="run4", help="name of the current run (default run4)")
+    ap.add_argument("--archive", action="append", default=[], metavar="NAME=PATH",
+                    help="a finished run's data directory, served at /NAME/ (repeatable)")
     ap.add_argument("--static", default=str(HERE / "static"), help="static files directory")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8790)
     args = ap.parse_args(argv)
     Handler.static_root = Path(args.static).expanduser().resolve()
-    Handler.data_root = Path(args.data).expanduser().resolve()
+    Handler.live_name = args.live_name
+    Handler.live_root = Path(args.data).expanduser().resolve()
+    Handler.archives = {}
+    for spec in args.archive:
+        name, _, path = spec.partition("=")
+        if not re.fullmatch(r"[a-z0-9]+", name) or not path or name == args.live_name:
+            ap.error("--archive needs NAME=PATH with a lowercase NAME that isn't the live run")
+        Handler.archives[name] = Path(path).expanduser().resolve()
     srv = Server((args.host, args.port), Handler)
-    print("serving %s and %s on %s:%d" % (Handler.static_root, Handler.data_root, args.host, args.port),
-          flush=True)
+    print("serving %s at / and %s on %s:%d" % (
+        Handler.live_root, ", ".join("%s at /%s/" % (p, n) for n, p in Handler.archives.items()) or "no archives",
+        args.host, args.port), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
